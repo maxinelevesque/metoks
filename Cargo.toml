@@ -1,12 +1,14 @@
 [package]
 name = "metoks"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.75"
 description = "Local-first token-usage tracker and weekly-budget forecaster for AI coding tools (Claude Code, Codex, OpenRouter) — CLI, TUI, and web dashboard"
 authors = ["Maxine Levesque <maxinelevesque24@gmail.com>"]
 license = "MIT OR Apache-2.0"
 readme = "README.md"
+repository = "https://github.com/maxinelevesque/metoks"
+homepage = "https://github.com/maxinelevesque/metoks"
 keywords = ["tokens", "usage", "llm", "dashboard", "forecast"]
 categories = ["command-line-utilities", "visualization"]
 # Whitelist what ships in the published crate. `static/**` (the built frontend)
