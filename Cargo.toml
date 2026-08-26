@@ -1,0 +1,65 @@
+[package]
+name = "metoks"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Local-first token-usage tracker and weekly-budget forecaster for AI coding tools (Claude Code, Codex, OpenRouter) — CLI, TUI, and web dashboard"
+authors = ["Maxine Levesque <maxinelevesque24@gmail.com>"]
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["tokens", "usage", "llm", "dashboard", "forecast"]
+categories = ["command-line-utilities", "visualization"]
+# Whitelist what ships in the published crate. `static/**` (the built frontend)
+# and `config.yaml` are embedded at build time (include_dir! / include_str!), so
+# they MUST be packaged; `frontend/`, logs, and dotdirs are excluded.
+include = [
+    "/src/**/*.rs",
+    "/static/**",
+    "/config.yaml",
+    "/README.md",
+    "/LICENSE-MIT",
+    "/LICENSE-APACHE",
+    "/Cargo.toml",
+]
+
+[[bin]]
+name = "metoks"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures = "0.3"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml_ng = "0.10"
+
+rusqlite = { version = "0.32", features = ["bundled"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.25"
+
+notify = "6"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+
+sha2 = "0.10"
+glob = "0.3"
+dirs = "5"
+
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+ratatui = "0.28"
+crossterm = "0.28"
+include_dir = "0.7"
+
+[dev-dependencies]
+tempfile = "3"

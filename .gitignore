@@ -1,0 +1,14 @@
+/target
+*.db
+*.db-shm
+*.db-wal
+/cache
+/frontend/node_modules
+/frontend/dist
+/src/static
+*.tsbuildinfo
+.DS_Store
+
+# local tooling / process state (not part of the crate)
+.claude/
+.day/

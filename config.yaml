@@ -1,0 +1,39 @@
+poll_interval_seconds: 60
+timezone: "America/Los_Angeles"        # window boundaries & day-of-week weighting
+port: 8787
+
+services:
+  claude_code:
+    enabled: true
+    log_globs: ["~/.claude/projects/**/*.jsonl"]
+    weekly_limit: { value: 300000000, unit: tokens, source: configured }
+
+  codex:
+    enabled: true
+    codex_home: null                    # null → $CODEX_HOME or ~/.codex
+    weekly_limit: { value: 150000000, unit: tokens, source: configured }
+
+  openrouter:
+    enabled: false
+    api_key_env: OPENROUTER_API_KEY     # read from env; never inline the key
+    weekly_budget: { value: 40.00, unit: usd, source: configured }
+
+  opencode:
+    enabled: false
+
+  anthropic_api:
+    enabled: false
+    admin_key_env: ANTHROPIC_ADMIN_KEY
+
+  openai_api:
+    enabled: false
+    api_key_env: OPENAI_API_KEY
+
+forecast:
+  model: "dow_weighted"                 # 'linear' | 'dow_weighted'
+  warn_threshold: 0.80                  # amber at projected 80% of limit
+  danger_threshold: 1.00                # red at projected >=100%
+  history_weeks: 4
+
+# pricing_overrides:
+#   some-model-id: { input: 0.000003, output: 0.000015, cache_read: 0.0000003, cache_write: 0.00000375 }
