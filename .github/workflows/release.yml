@@ -1,0 +1,102 @@
+name: Release
+
+# Continuous delivery: on a version tag (vX.Y.Z), build binaries for every
+# platform, attach them to the GitHub release, and publish to crates.io.
+# `workflow_dispatch` runs the build matrix without releasing (artifacts only),
+# so the pipeline can be tested without cutting a version.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # create/upload GitHub releases
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      # The binary embeds the built frontend (include_dir!), so build it first.
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          name="metoks-${{ github.ref_name }}-${{ matrix.target }}"
+          tar -czf "$name.tar.gz" -C "target/${{ matrix.target }}/release" metoks
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "metoks-${{ github.ref_name }}-${{ matrix.target }}"
+          Compress-Archive -Path "target/${{ matrix.target }}/release/metoks.exe" -DestinationPath "$name.zip"
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: metoks-${{ matrix.target }}
+          path: |
+            metoks-*.tar.gz
+            metoks-*.zip
+          if-no-files-found: error
+      - name: Attach to GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            metoks-*.tar.gz
+            metoks-*.zip
+          fail_on_unmatched_files: false
+          generate_release_notes: true
+
+  publish-crate:
+    name: publish to crates.io
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Publish
+        if: env.CARGO_REGISTRY_TOKEN != ''
+        run: cargo publish --locked
+      - name: Skipped notice
+        if: env.CARGO_REGISTRY_TOKEN == ''
+        run: echo "CARGO_REGISTRY_TOKEN secret not set — skipping crates.io publish."
