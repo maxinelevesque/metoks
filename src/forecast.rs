@@ -539,31 +539,30 @@ pub fn forecast_service(
     };
     let model_name = "trend";
 
-    // Level (cap + current %) is grounded on the user's fiducials when present;
-    // only the token delta since the last reading comes from our log counting.
-    let mut fids = db::fiducials_since(&conn, service, start)?;
-    if let Some(last) = fids.last_mut() {
-        // Recompute the local token observation at the reading time *live* (over
-        // the current window), so the cap/axis calibration matches the token
-        // curve the chart draws — local log lines with past timestamps can flush
-        // in after a reading was logged, growing the recomputed cumulative.
-        last.measured_cumulative =
-            db::consumed_in_window(&conn, service, unit, start, last.ts)?;
-    }
-    let (limit, limit_source, pct_now) = match cap_from_fiducials(&fids, consumed) {
-        Some((cap, src, pct)) => (Some(cap), Some(src), Some(pct)),
-        None => {
-            let (cap, src) = resolve_cap(&conn, cfg, service, unit, consumed)?;
-            let pct = cap.filter(|c| *c > 0.0).map(|c| consumed / c);
-            (cap, src, pct)
-        }
-    };
+    // Level (cap + current %) — grounded on readings and stable across provider
+    // quota resets (a reset zeroes the counter, not the weekly allowance).
+    let (limit, limit_source, pct_now) =
+        resolve_cap_and_pct(&conn, cfg, service, unit, now, start, consumed)?;
 
     let pct_projected = match (limit, pct_now) {
         (Some(cap), Some(pn)) if cap > 0.0 => Some(pn + (projected_tokens - consumed) / cap),
         _ => None,
     };
-    let status = status_for(pct_projected, warn, danger);
+
+    // Just after a reset a fixed window has too little history to project from;
+    // a rolling window is low-confidence only when there's no usage at all.
+    let elapsed_hours = (now - start).num_hours();
+    let low_confidence = if rolling {
+        consumed <= 0.0
+    } else {
+        elapsed_hours < 24
+    };
+    // Don't raise an alarm on an unreliable early-window projection.
+    let status = if low_confidence {
+        "unknown".to_string()
+    } else {
+        status_for(pct_projected, warn, danger)
+    };
 
     // ETA to 100%: tokens remaining to cap ÷ burn rate.
     let eta = match (limit, pct_now) {
@@ -582,15 +581,6 @@ pub fn forecast_service(
             }
         }
         _ => None,
-    };
-
-    // Just after a reset a fixed window has too little history to project from;
-    // a rolling window is low-confidence only when there's no usage at all.
-    let elapsed_hours = (now - start).num_hours();
-    let low_confidence = if rolling {
-        consumed <= 0.0
-    } else {
-        elapsed_hours < 24
     };
 
     Ok(Forecast {
@@ -612,20 +602,110 @@ pub fn forecast_service(
     })
 }
 
-/// Cap + grounded current-fraction from the *last* fiducial: the conversion is
-/// anchored so the local token observation at that reading equals its percent
-/// (`cap = measured / (percent/100)`), and everything downstream — pct_now, the
-/// cone, and the chart's aligned axes — uses this one calibration so they line up.
-fn cap_from_fiducials(fids: &[db::Fiducial], consumed: f64) -> Option<(f64, String, f64)> {
-    let last = fids.last()?;
-    if last.percent <= 0.0 || last.measured_cumulative <= 0.0 {
+/// Readings below this percent are too noisy to derive a cap from (e.g. a "1%"
+/// reading right after a reset implies a wildly imprecise cap).
+const CAP_MIN_PERCENT: f64 = 3.0;
+/// How far back to look for a good reading to carry a cap across a reset.
+const CAP_CARRY_DAYS: i64 = 21;
+
+/// Plan cap (tokens per full window) from a set of `(measured, percent)` readings:
+/// the median of `measured / (percent/100)` over readings with a usable percent.
+/// The median is robust to a single off reading. Returns None if none qualify.
+fn plan_cap(readings: &[(f64, f64)]) -> Option<f64> {
+    let mut caps: Vec<f64> = readings
+        .iter()
+        .filter(|(m, p)| *p >= CAP_MIN_PERCENT && *m > 0.0)
+        .map(|(m, p)| m / (p / 100.0))
+        .collect();
+    if caps.is_empty() {
         return None;
     }
-    let cap = last.measured_cumulative / (last.percent / 100.0);
-    if cap <= 0.0 {
-        return None;
+    caps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Some(caps[caps.len() / 2])
+}
+
+fn same_window(a: DateTime<Utc>, b: DateTime<Utc>) -> bool {
+    (a - b).num_seconds().abs() < 3600
+}
+
+/// Resolve the token cap and current fraction, stable across provider quota
+/// resets. Precedence:
+///   1. latest in-window reading (≥floor) — live-recomputed so the chart aligns;
+///   2. provider rate-limit percent (Codex), when it carries signal;
+///   3. **carried** cap from recent readings (median) — survives a reset that
+///      moved the window past the last good reading;
+///   4. a persisted "observed" cap (covers provider-only users across resets);
+///   5. the configured cap.
+/// `consumed` is this window's usage, so pct_now resets with the window while the
+/// cap (the plan allowance) does not.
+fn resolve_cap_and_pct(
+    conn: &rusqlite::Connection,
+    cfg: &Config,
+    service: &str,
+    unit: Unit,
+    now: DateTime<Utc>,
+    start: DateTime<Utc>,
+    consumed: f64,
+) -> Result<(Option<f64>, Option<String>, Option<f64>)> {
+    // 1. Latest reading that belongs to the *current* window (matched by its own
+    //    stored window_start, not just ts) with enough signal → live-recompute so
+    //    the token curve passes through the dot.
+    let win_fids = db::fiducials_since(conn, service, start)?;
+    if let Some(f) = win_fids
+        .iter()
+        .rev()
+        .find(|f| f.percent >= CAP_MIN_PERCENT && same_window(f.window_start, start))
+    {
+        let measured = db::consumed_in_window(conn, service, unit, start, f.ts)?;
+        if measured > 0.0 {
+            let cap = measured / (f.percent / 100.0);
+            persist_observed_cap(conn, service, cap)?;
+            return Ok((Some(cap), Some("fiducial".into()), Some(consumed / cap)));
+        }
     }
-    Some((cap, "fiducial".to_string(), consumed / cap))
+
+    // 2. Provider-reported percent (Codex), when usable.
+    if let Some(rl) = db::get_rate_limit(conn, service, "weekly")? {
+        if let Some(p) = rl.used_percent {
+            if p >= CAP_MIN_PERCENT && consumed > 0.0 {
+                let cap = consumed / (p / 100.0);
+                persist_observed_cap(conn, service, cap)?;
+                return Ok((Some(cap), Some("real".into()), Some(consumed / cap)));
+            }
+        }
+    }
+
+    // 3. Carry the plan cap across a reset: median of recent good readings.
+    let recent = db::fiducials_since(conn, service, now - Duration::days(CAP_CARRY_DAYS))?;
+    let readings: Vec<(f64, f64)> = recent
+        .iter()
+        .map(|f| (f.measured_cumulative, f.percent))
+        .collect();
+    if let Some(cap) = plan_cap(&readings) {
+        return Ok((Some(cap), Some("carried".into()), Some(consumed / cap)));
+    }
+
+    // 4. Persisted observed cap (provider-only users across resets).
+    if let Some(v) = db::get_kv(conn, &observed_cap_key(service))? {
+        if let Ok(cap) = v.parse::<f64>() {
+            if cap > 0.0 {
+                return Ok((Some(cap), Some("carried".into()), Some(consumed / cap)));
+            }
+        }
+    }
+
+    // 5. Configured cap.
+    let (cap, src) = resolve_cap(conn, cfg, service, unit, consumed)?;
+    let pct = cap.filter(|c| *c > 0.0).map(|c| consumed / c);
+    Ok((cap, src, pct))
+}
+
+fn observed_cap_key(service: &str) -> String {
+    format!("observed_cap:{service}")
+}
+
+fn persist_observed_cap(conn: &rusqlite::Connection, service: &str, cap: f64) -> Result<()> {
+    db::set_kv(conn, &observed_cap_key(service), &format!("{cap}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -877,13 +957,9 @@ pub fn apply_anchor(
         db::upsert_limit(&conn, service, "weekly", None, unit, "fiducial", Some(r), None)?;
     }
 
-    // Report the cap now derived from the fiducial history.
-    let fids = db::fiducials_since(&conn, service, start)?;
-    cap_from_fiducials(&fids, consumed)
-        .map(|(cap, _, _)| cap)
-        .ok_or_else(|| {
-            anyhow::anyhow!("recorded, but no measured usage yet to derive a cap from")
-        })
+    // Report the cap now derived from the reading history.
+    let (cap, _src, _pct) = resolve_cap_and_pct(&conn, cfg, service, unit, now, start, consumed)?;
+    cap.ok_or_else(|| anyhow::anyhow!("recorded, but no usable reading yet to derive a cap from"))
 }
 
 /// Enabled services in a stable order.
@@ -1023,47 +1099,22 @@ mod tests {
         assert_eq!(end, dt("2026-08-27T00:00:00Z"));
     }
 
-    fn fid(measured: f64, percent: f64) -> db::Fiducial {
-        db::Fiducial {
-            id: 0,
-            service: "s".into(),
-            window_kind: "weekly".into(),
-            ts: dt("2026-08-20T00:00:00Z"),
-            percent,
-            resets_at: None,
-            window_start: dt("2026-08-18T00:00:00Z"),
-            measured_cumulative: measured,
-            unit: crate::models::Unit::Tokens,
-        }
+    #[test]
+    fn plan_cap_is_median_of_readings() {
+        // caps: 100/.5=200, 69/.05=1380, 200/.09≈2222 → median 1380.
+        let cap = plan_cap(&[(100.0, 50.0), (69.0, 5.0), (200.0, 9.0)]).unwrap();
+        assert!((cap - 1380.0).abs() < 1.0, "cap={cap}");
     }
 
     #[test]
-    fn single_fiducial_derives_cap_and_anchors_pct() {
-        // measured 100 tokens = 50% → cap 200. At consumed 120 → 60%.
-        let (cap, src, pct) = cap_from_fiducials(&[fid(100.0, 50.0)], 120.0).unwrap();
-        assert!((cap - 200.0).abs() < 1e-6);
-        assert_eq!(src, "fiducial");
-        assert!((pct - 0.60).abs() < 1e-6);
-        // Exactly at the reading, pct == the reported percent.
-        let (_, _, pct_at) = cap_from_fiducials(&[fid(100.0, 50.0)], 100.0).unwrap();
-        assert!((pct_at - 0.50).abs() < 1e-6);
-    }
-
-    #[test]
-    fn cap_anchors_on_last_reading() {
-        // Calibration uses the latest reading: (150 tokens, 60%) → cap 250.
-        let fids = [fid(100.0, 40.0), fid(150.0, 60.0)];
-        let (cap, _, pct) = cap_from_fiducials(&fids, 175.0).unwrap();
-        assert!((cap - 250.0).abs() < 1e-6, "cap={cap}");
-        // consumed 175 → 70%. At the reading (consumed==measured) it's exactly 60%.
-        assert!((pct - 0.70).abs() < 1e-6, "pct={pct}");
-        let (_, _, pct_at) = cap_from_fiducials(&fids, 150.0).unwrap();
-        assert!((pct_at - 0.60).abs() < 1e-6, "pct_at={pct_at}");
-    }
-
-    #[test]
-    fn no_fiducials_returns_none() {
-        assert!(cap_from_fiducials(&[], 100.0).is_none());
+    fn plan_cap_ignores_noisy_low_readings() {
+        // A "1%" reading right after a reset (1.6 tokens) would imply cap 160 —
+        // it's below the floor and must be ignored; the 20% reading wins.
+        let cap = plan_cap(&[(1.6, 1.0), (315.0, 20.0)]).unwrap();
+        assert!((cap - 1575.0).abs() < 1.0, "cap={cap}");
+        // If every reading is sub-floor, there's no usable cap.
+        assert!(plan_cap(&[(1.6, 1.0)]).is_none());
+        assert!(plan_cap(&[]).is_none());
     }
 
     #[test]

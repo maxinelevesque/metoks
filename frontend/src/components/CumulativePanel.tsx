@@ -26,6 +26,7 @@ import { fmtTokens, fmtPct, fmtDateTime } from "../format";
 const CAP_SOURCE_LABEL: Record<string, string> = {
   fiducial: "your readings",
   real: "provider",
+  carried: "carried over reset",
   anchored: "your readings",
   configured: "config",
   autodetected: "auto-detected",
