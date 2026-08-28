@@ -618,55 +618,120 @@ fn plan_cap(readings: &[(f64, f64)]) -> Option<f64> {
 ///   2. provider rate-limit percent (Codex), for setups with no manual readings;
 ///   3. a persisted "observed" cap (last good value, across resets);
 ///   4. the configured cap.
-/// `consumed` is this window's usage, so pct_now resets with the window.
+/// `consumed` is this window's usage, so pct_now resets with the window. The cap
+/// is a robust median (for projection); the current % is anchored to the user's
+/// latest reading (so "I said 38%" shows 38%), plus the token delta since.
 fn resolve_cap_and_pct(
     conn: &rusqlite::Connection,
     cfg: &Config,
     service: &str,
     unit: Unit,
     now: DateTime<Utc>,
-    _start: DateTime<Utc>,
+    start: DateTime<Utc>,
     consumed: f64,
 ) -> Result<(Option<f64>, Option<String>, Option<f64>)> {
-    // 1. Robust plan cap: median of measured/percent over recent readings. Each
-    //    reading's tokens are recomputed *live* over its own window (not the frozen
-    //    snapshot), so caps self-correct once the collector catches up — a reading
-    //    logged while ingestion was behind stops implying a too-small cap.
+    let (cap, source) = resolve_cap_value(conn, cfg, service, unit, now, start, consumed)?;
+    let pct_now = match cap {
+        Some(c) if c > 0.0 => Some(anchored_pct_now(conn, service, unit, start, consumed, c)?),
+        _ => None,
+    };
+    Ok((cap, source, pct_now))
+}
+
+/// Current utilization fraction, anchored to the latest reading in *this* window:
+/// `latest.percent + (consumed_now − tokens_at_reading) / cap`. With no in-window
+/// reading (e.g. right after a reset) it falls back to `consumed / cap`.
+fn anchored_pct_now(
+    conn: &rusqlite::Connection,
+    service: &str,
+    unit: Unit,
+    start: DateTime<Utc>,
+    consumed: f64,
+    cap: f64,
+) -> Result<f64> {
+    let in_window = db::fiducials_since(conn, service, start)?;
+    if let Some(last) = in_window.last() {
+        let measured = db::consumed_in_window(conn, service, unit, start, last.ts)?;
+        return Ok(last.percent / 100.0 + (consumed - measured) / cap);
+    }
+    Ok(consumed / cap)
+}
+
+/// A reading whose implied cap is below this fraction of the robust median is
+/// treated as logged while counting was behind, and ignored for the cap.
+const CAP_OUTLIER_FRAC: f64 = 0.4;
+
+/// The plan's weekly token cap. In normal use it comes from your *latest
+/// current-window reading* (so the chart curve, the reading dot, and the gauge
+/// all agree), with each reading's tokens recomputed live. A robust median of
+/// recent readings backs it up: it carries the cap across a provider quota reset
+/// (a reset zeroes the counter, not the allowance) and guards against a single
+/// reading logged before the collector caught up. Precedence: latest in-window
+/// reading (guarded) → carry-median → provider percent → observed → configured.
+fn resolve_cap_value(
+    conn: &rusqlite::Connection,
+    cfg: &Config,
+    service: &str,
+    unit: Unit,
+    now: DateTime<Utc>,
+    start: DateTime<Utc>,
+    consumed: f64,
+) -> Result<(Option<f64>, Option<String>)> {
+    // Recent readings, each recomputed live over its own window, and their median
+    // cap (used both as a fallback and as an outlier guard).
     let recent = db::fiducials_since(conn, service, now - Duration::days(CAP_CARRY_DAYS))?;
     let mut readings: Vec<(f64, f64)> = Vec::with_capacity(recent.len());
     for f in &recent {
         let measured = db::consumed_in_window(conn, service, unit, f.window_start, f.ts)?;
         readings.push((measured, f.percent));
     }
-    if let Some(cap) = plan_cap(&readings) {
-        persist_observed_cap(conn, service, cap)?;
-        return Ok((Some(cap), Some("fiducial".into()), Some(consumed / cap)));
+    let median = plan_cap(&readings);
+
+    // 1. Latest current-window reading (≥floor) → cap from its live tokens, unless
+    //    it's a severe under-outlier vs the median (counting was behind).
+    if let Some(last) = recent
+        .iter()
+        .rev()
+        .find(|f| f.percent >= CAP_MIN_PERCENT && f.ts >= start)
+    {
+        let measured = db::consumed_in_window(conn, service, unit, start, last.ts)?;
+        if measured > 0.0 {
+            let cap = measured / (last.percent / 100.0);
+            if median.map_or(true, |m| cap >= CAP_OUTLIER_FRAC * m) {
+                persist_observed_cap(conn, service, cap)?;
+                return Ok((Some(cap), Some("fiducial".into())));
+            }
+        }
     }
 
-    // 2. Provider-reported percent (Codex), for services with no manual readings.
+    // 2. Carry the plan cap across a reset: robust median of recent readings.
+    if let Some(cap) = median {
+        persist_observed_cap(conn, service, cap)?;
+        return Ok((Some(cap), Some("carried".into())));
+    }
+
+    // 3. Provider-reported percent (Codex), for setups with no manual readings.
     if let Some(rl) = db::get_rate_limit(conn, service, "weekly")? {
         if let Some(p) = rl.used_percent {
             if p >= CAP_MIN_PERCENT && consumed > 0.0 {
                 let cap = consumed / (p / 100.0);
                 persist_observed_cap(conn, service, cap)?;
-                return Ok((Some(cap), Some("real".into()), Some(consumed / cap)));
+                return Ok((Some(cap), Some("real".into())));
             }
         }
     }
 
-    // 3. Persisted observed cap (last good value, carried across resets).
+    // 4. Persisted observed cap (last good value, carried across resets).
     if let Some(v) = db::get_kv(conn, &observed_cap_key(service))? {
         if let Ok(cap) = v.parse::<f64>() {
             if cap > 0.0 {
-                return Ok((Some(cap), Some("carried".into()), Some(consumed / cap)));
+                return Ok((Some(cap), Some("carried".into())));
             }
         }
     }
 
-    // 4. Configured cap.
-    let (cap, src) = resolve_cap(conn, cfg, service, unit, consumed)?;
-    let pct = cap.filter(|c| *c > 0.0).map(|c| consumed / c);
-    Ok((cap, src, pct))
+    // 5. Configured cap.
+    resolve_cap(conn, cfg, service, unit, consumed)
 }
 
 fn observed_cap_key(service: &str) -> String {
