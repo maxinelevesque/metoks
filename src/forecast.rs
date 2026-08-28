@@ -336,54 +336,37 @@ const PACE_HALF_LIFE_DAYS: f64 = 5.0;
 const CONE_Z: f64 = 1.0; // ±1σ band
 const CONE_STEPS: i64 = 32;
 
-/// Fraction of a week's activity that falls on each weekday (Mon..Sun),
-/// from the normalized dow/hour grid. Sums to ~1.
-fn day_shares(grid: &DowGrid) -> [f64; 7] {
-    let total = grid.total();
-    let mut out = [0.0f64; 7];
-    for (d, row) in grid.weight.iter().enumerate() {
-        let s: f64 = row.iter().sum();
-        out[d] = if total > 0.0 { s / total } else { 1.0 / 7.0 };
-    }
-    out
-}
-
-/// Minimum weekday share used when de-seasonalizing, so a quiet weekday can't
-/// inflate a single day's weekly-equivalent without bound.
-const DAY_SHARE_FLOOR: f64 = 0.07;
 /// Band bounds relative to the level, so σ is never zero or absurd.
 const SIGMA_MIN_FRAC: f64 = 0.10;
 const SIGMA_MAX_FRAC: f64 = 0.60;
 
-/// Estimate the current weekly volume `P` (tokens/week) and its 1σ from the last
-/// few weeks of daily usage, de-seasonalized by weekday and EWMA-weighted toward
-/// recent days. Robust to transients: outlier days are winsorized around a
-/// weighted median before the mean/σ are taken (see `robust_pace`).
+/// Estimate the weekly volume `P` (tokens/week) and its 1σ from recent daily
+/// usage: a robust (winsorized, EWMA-weighted toward recent days) mean daily
+/// volume × 7. The day-of-week grid is intentionally *not* used here — it shapes
+/// the projection cone, but de-seasonalizing the level lets one outlier day
+/// distort every other day's estimate (a spike inflates the whole grid, which
+/// then divides normal days by a too-small share). Winsorizing daily totals
+/// directly keeps a 10× spike from running the pace away.
 fn estimate_pace(
     conn: &rusqlite::Connection,
     service: &str,
     unit: Unit,
-    grid: &DowGrid,
     now: DateTime<Utc>,
 ) -> Result<(f64, f64)> {
-    let shares = day_shares(grid);
-    let mut samples: Vec<(f64, f64)> = Vec::new(); // (weekly-equiv volume, weight)
+    let mut samples: Vec<(f64, f64)> = Vec::new(); // (daily volume, EWMA weight)
     for d in 0..PACE_LOOKBACK_DAYS {
         let end = now - Duration::days(d);
         let start = end - Duration::days(1);
         let total = db::consumed_in_window(conn, service, unit, start, end)?;
-        let mid = start + Duration::hours(12);
-        let dow = mid.with_timezone(&grid.tz).weekday().num_days_from_monday() as usize;
-        let share = shares[dow].max(DAY_SHARE_FLOOR);
-        let weekly_equiv = total / share;
         let w = 0.5f64.powf(d as f64 / PACE_HALF_LIFE_DAYS);
-        samples.push((weekly_equiv, w));
+        samples.push((total, w));
     }
-    if samples.iter().map(|(_, w)| *w).sum::<f64>() <= 0.0 || grid.total() <= 0.0 {
+    if samples.iter().map(|(_, w)| *w).sum::<f64>() <= 0.0 {
         let p = db::consumed_in_window(conn, service, unit, now - Duration::days(7), now)?;
         return Ok((p, 0.3 * p));
     }
-    Ok(robust_pace(&samples))
+    let (daily, daily_sigma) = robust_pace(&samples);
+    Ok((daily * 7.0, daily_sigma * 7.0))
 }
 
 /// Weighted median of `(value, weight)` samples.
@@ -526,7 +509,7 @@ pub fn forecast_service(
     // Projected *tokens* at the horizon, from the trend model: current weekly
     // pace (recent-weighted, weekday-shaped) applied along the future profile.
     let grid = build_grid(&conn, service, unit, tz, now, cfg.forecast.history_weeks)?;
-    let (pace, _sigma) = estimate_pace(&conn, service, unit, &grid, now)?;
+    let (pace, _sigma) = estimate_pace(&conn, service, unit, now)?;
     let horizon = horizon_end(now, end, rolling);
     let projected_tokens = if grid.total() > 0.0 {
         let w = grid.weight_between(now, horizon);
@@ -624,47 +607,43 @@ fn plan_cap(readings: &[(f64, f64)]) -> Option<f64> {
     Some(caps[caps.len() / 2])
 }
 
-fn same_window(a: DateTime<Utc>, b: DateTime<Utc>) -> bool {
-    (a - b).num_seconds().abs() < 3600
-}
-
-/// Resolve the token cap and current fraction, stable across provider quota
-/// resets. Precedence:
-///   1. latest in-window reading (≥floor) — live-recomputed so the chart aligns;
-///   2. provider rate-limit percent (Codex), when it carries signal;
-///   3. **carried** cap from recent readings (median) — survives a reset that
-///      moved the window past the last good reading;
-///   4. a persisted "observed" cap (covers provider-only users across resets);
-///   5. the configured cap.
-/// `consumed` is this window's usage, so pct_now resets with the window while the
-/// cap (the plan allowance) does not.
+/// Resolve the token cap and current fraction. The cap is the plan's weekly
+/// allowance — it's stable, so it's estimated *robustly from many readings* (a
+/// median), not from whatever the latest one implies. This survives provider
+/// quota resets (a reset zeroes the counter, not the allowance) and shrugs off a
+/// single garbage reading — e.g. a fresh post-reset "6%" when our own counting
+/// for the new window hasn't caught up yet would imply a wildly small cap, but
+/// it's outvoted by the mature readings. Precedence:
+///   1. median cap over recent readings (≥floor percent);
+///   2. provider rate-limit percent (Codex), for setups with no manual readings;
+///   3. a persisted "observed" cap (last good value, across resets);
+///   4. the configured cap.
+/// `consumed` is this window's usage, so pct_now resets with the window.
 fn resolve_cap_and_pct(
     conn: &rusqlite::Connection,
     cfg: &Config,
     service: &str,
     unit: Unit,
     now: DateTime<Utc>,
-    start: DateTime<Utc>,
+    _start: DateTime<Utc>,
     consumed: f64,
 ) -> Result<(Option<f64>, Option<String>, Option<f64>)> {
-    // 1. Latest reading that belongs to the *current* window (matched by its own
-    //    stored window_start, not just ts) with enough signal → live-recompute so
-    //    the token curve passes through the dot.
-    let win_fids = db::fiducials_since(conn, service, start)?;
-    if let Some(f) = win_fids
-        .iter()
-        .rev()
-        .find(|f| f.percent >= CAP_MIN_PERCENT && same_window(f.window_start, start))
-    {
-        let measured = db::consumed_in_window(conn, service, unit, start, f.ts)?;
-        if measured > 0.0 {
-            let cap = measured / (f.percent / 100.0);
-            persist_observed_cap(conn, service, cap)?;
-            return Ok((Some(cap), Some("fiducial".into()), Some(consumed / cap)));
-        }
+    // 1. Robust plan cap: median of measured/percent over recent readings. Each
+    //    reading's tokens are recomputed *live* over its own window (not the frozen
+    //    snapshot), so caps self-correct once the collector catches up — a reading
+    //    logged while ingestion was behind stops implying a too-small cap.
+    let recent = db::fiducials_since(conn, service, now - Duration::days(CAP_CARRY_DAYS))?;
+    let mut readings: Vec<(f64, f64)> = Vec::with_capacity(recent.len());
+    for f in &recent {
+        let measured = db::consumed_in_window(conn, service, unit, f.window_start, f.ts)?;
+        readings.push((measured, f.percent));
+    }
+    if let Some(cap) = plan_cap(&readings) {
+        persist_observed_cap(conn, service, cap)?;
+        return Ok((Some(cap), Some("fiducial".into()), Some(consumed / cap)));
     }
 
-    // 2. Provider-reported percent (Codex), when usable.
+    // 2. Provider-reported percent (Codex), for services with no manual readings.
     if let Some(rl) = db::get_rate_limit(conn, service, "weekly")? {
         if let Some(p) = rl.used_percent {
             if p >= CAP_MIN_PERCENT && consumed > 0.0 {
@@ -675,17 +654,7 @@ fn resolve_cap_and_pct(
         }
     }
 
-    // 3. Carry the plan cap across a reset: median of recent good readings.
-    let recent = db::fiducials_since(conn, service, now - Duration::days(CAP_CARRY_DAYS))?;
-    let readings: Vec<(f64, f64)> = recent
-        .iter()
-        .map(|f| (f.measured_cumulative, f.percent))
-        .collect();
-    if let Some(cap) = plan_cap(&readings) {
-        return Ok((Some(cap), Some("carried".into()), Some(consumed / cap)));
-    }
-
-    // 4. Persisted observed cap (provider-only users across resets).
+    // 3. Persisted observed cap (last good value, carried across resets).
     if let Some(v) = db::get_kv(conn, &observed_cap_key(service))? {
         if let Ok(cap) = v.parse::<f64>() {
             if cap > 0.0 {
@@ -694,7 +663,7 @@ fn resolve_cap_and_pct(
         }
     }
 
-    // 5. Configured cap.
+    // 4. Configured cap.
     let (cap, src) = resolve_cap(conn, cfg, service, unit, consumed)?;
     let pct = cap.filter(|c| *c > 0.0).map(|c| consumed / c);
     Ok((cap, src, pct))
@@ -879,7 +848,7 @@ pub fn cumulative_view(
     // current %, over now → window_end.
     let tz: Tz = cfg.timezone.parse().unwrap_or(chrono_tz::UTC);
     let grid = build_grid(&conn, service, unit, tz, now, cfg.forecast.history_weeks)?;
-    let (pace_weekly, pace_sigma) = estimate_pace(&conn, service, unit, &grid, now)?;
+    let (pace_weekly, pace_sigma) = estimate_pace(&conn, service, unit, now)?;
     let token_cone = build_cone(
         &conn, service, unit, &grid, f.consumed, now, f.window_end, rolling, pace_weekly,
         pace_sigma,

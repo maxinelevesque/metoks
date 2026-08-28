@@ -170,6 +170,7 @@ async fn cmd_backfill(config_path: &std::path::Path, db_path: &str) -> Result<()
 async fn cmd_forecast(config_path: &std::path::Path, db_path: &str) -> Result<()> {
     let cfg = Config::load_or_default(config_path)?;
     let pool = db::open(db_path)?;
+    ingest(&pool, &cfg).await?;
     let now = chrono::Utc::now();
     for svc in forecast::enabled_services(&cfg) {
         let f = forecast::forecast_service(&pool, &cfg, svc, now)?;
@@ -203,6 +204,24 @@ async fn cmd_forecast(config_path: &std::path::Path, db_path: &str) -> Result<()
     Ok(())
 }
 
+/// Incrementally ingest new local log lines (Claude Code + Codex) so one-shot
+/// commands reflect current usage even when `run` isn't tailing. Cheap: the
+/// collectors read only bytes appended since their stored offsets.
+async fn ingest(pool: &db::DbPool, cfg: &Config) -> Result<()> {
+    let pricing = pricing::Pricing::load(&cfg.pricing_overrides).await?;
+    if cfg.services.claude_code.enabled {
+        if let Err(e) = collectors::claude_code::backfill(pool, cfg, &pricing) {
+            tracing::warn!("claude_code ingest: {e}");
+        }
+    }
+    if cfg.services.codex.enabled {
+        if let Err(e) = collectors::codex::backfill(pool, cfg, &pricing) {
+            tracing::warn!("codex ingest: {e}");
+        }
+    }
+    Ok(())
+}
+
 async fn cmd_anchor(
     config_path: &std::path::Path,
     db_path: &str,
@@ -212,6 +231,7 @@ async fn cmd_anchor(
 ) -> Result<()> {
     let cfg = Config::load_or_default(config_path)?;
     let pool = db::open(db_path)?;
+    ingest(&pool, &cfg).await?; // log the reading against up-to-date counts
     let now = chrono::Utc::now();
     let reset = resets_at
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
@@ -262,6 +282,7 @@ async fn cmd_fiducials(db_path: &str, service: &str) -> Result<()> {
 async fn cmd_status(config_path: &std::path::Path, db_path: &str) -> Result<()> {
     let cfg = Config::load_or_default(config_path)?;
     let pool = db::open(db_path)?;
+    ingest(&pool, &cfg).await?;
     let now = chrono::Utc::now();
     for svc in forecast::enabled_services(&cfg) {
         let f = forecast::forecast_service(&pool, &cfg, svc, now)?;
@@ -286,6 +307,7 @@ async fn cmd_status(config_path: &std::path::Path, db_path: &str) -> Result<()> 
 async fn cmd_tui(config_path: &std::path::Path, db_path: &str) -> Result<()> {
     let cfg = Config::load_or_default(config_path)?;
     let pool = db::open(db_path)?;
+    ingest(&pool, &cfg).await?; // fresh counts before the dashboard opens
     tui::run(&pool, &cfg)
 }
 
