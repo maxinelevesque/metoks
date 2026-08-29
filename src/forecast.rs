@@ -1,8 +1,12 @@
-//! Forecasting engine (DESIGN.md §10–§11).
+//! Forecasting engine.
 //!
-//! Window resolution + two burn models: `linear` and `dow_weighted`. The pure
-//! math functions take plain numbers so they can be unit-tested against
-//! hand-computed values; `forecast_service` wires them to the DB.
+//! Usage is modelled as an inhomogeneous point process: a per-(day-of-week,hour)
+//! rate `λ` with predictive variance, fitted from every covered hour of history
+//! (idle hours as zeros; extreme hours winsorized; sparse cells shrunk toward a
+//! separable day-cycle × dow-cycle model). The projection sums `λ` over future
+//! hours for the mean and sums the variance for a ±1σ cone that widens with the
+//! horizon (independent increments). The cap and current % are grounded on the
+//! user's readings (see `resolve_cap_value` / `anchored_pct_now`).
 
 use anyhow::Result;
 use chrono::{DateTime, Datelike, Duration, TimeZone, Timelike, Utc};
@@ -82,89 +86,213 @@ pub fn linear(
     }
 }
 
-/// A normalized (day-of-week, hour) activity grid summing to 1.0 over a week.
+/// An inhomogeneous rate model of token consumption: for each (day-of-week, hour)
+/// cell it holds the expected tokens in that hour (`lambda`) and the predictive
+/// variance of an hour's usage (`var`), estimated from every covered hour of
+/// history (idle hours counted as zeros). Treating usage as a process with an
+/// hour-varying rate, we project by summing `lambda` over future hours (mean) and
+/// summing `var` (independent increments → the cone widens with the horizon). Cell
+/// estimates are shrunk toward a separable day-cycle × dow-cycle model, so sparse
+/// cells still respect the two cycles.
 #[derive(Debug, Clone)]
-pub struct DowGrid {
-    /// weight[dow][hour], dow 0=Mon..6=Sun (config tz), summing to ~1.0
-    pub weight: [[f64; 24]; 7],
+pub struct RateModel {
+    pub lambda: [[f64; 24]; 7], // expected tokens/hour, dow 0=Mon..6=Sun (config tz)
+    pub var: [[f64; 24]; 7],    // predictive variance of an hour's tokens
     pub tz: Tz,
+    pub weeks: f64, // hours of coverage / 168
 }
 
-impl DowGrid {
-    pub fn total(&self) -> f64 {
-        self.weight.iter().flatten().sum()
+impl RateModel {
+    pub fn has_data(&self) -> bool {
+        self.weeks > 0.0 && self.lambda.iter().flatten().any(|&x| x > 0.0)
+    }
+    /// Expected tokens over a full 7-day cycle.
+    pub fn weekly_mean(&self) -> f64 {
+        self.lambda.iter().flatten().sum()
+    }
+    /// 1σ of the weekly total (independent hours).
+    pub fn weekly_sigma(&self) -> f64 {
+        self.var.iter().flatten().sum::<f64>().max(0.0).sqrt()
     }
 
-    /// Weight covered by the interval [a,b], apportioning partial hours. Iterates
-    /// hour-by-hour (a 7-day window is ≤168 steps) so window alignment to
-    /// calendar hours doesn't matter.
-    pub fn weight_between(&self, a: DateTime<Utc>, b: DateTime<Utc>) -> f64 {
-        if b <= a {
-            return 0.0;
+    /// Cumulative expected mean and variance of usage over (now, upto],
+    /// apportioning partial hours (variance additive in time).
+    pub fn accumulate_future(&self, now: DateTime<Utc>, upto: DateTime<Utc>) -> (f64, f64) {
+        if upto <= now {
+            return (0.0, 0.0);
         }
-        let mut acc = 0.0;
-        let mut cur = a;
-        while cur < b {
-            let local = cur.with_timezone(&self.tz);
-            // Start of this local hour, then next hour boundary.
-            let hour_start_local = self
+        let (mut cmean, mut cvar) = (0.0, 0.0);
+        let mut cur = now;
+        while cur < upto {
+            let l = cur.with_timezone(&self.tz);
+            let hour_start = self
                 .tz
-                .with_ymd_and_hms(local.year(), local.month(), local.day(), local.hour(), 0, 0)
+                .with_ymd_and_hms(l.year(), l.month(), l.day(), l.hour(), 0, 0)
                 .single()
-                .unwrap_or(local);
-            let hour_start = hour_start_local.with_timezone(&Utc);
-            let next_hour = hour_start + Duration::hours(1);
-            let seg_end = next_hour.min(b);
+                .map(|d| d.with_timezone(&Utc))
+                .unwrap_or(cur);
+            let seg_end = (hour_start + Duration::hours(1)).min(upto);
             let frac = (seg_end - cur).num_seconds() as f64 / 3600.0;
-            let dow = local.weekday().num_days_from_monday() as usize; // 0=Mon
-            let hour = local.hour() as usize;
-            acc += self.weight[dow][hour] * frac;
+            let d = l.weekday().num_days_from_monday() as usize;
+            let h = l.hour() as usize;
+            cmean += self.lambda[d][h] * frac;
+            cvar += self.var[d][h] * frac;
             cur = seg_end;
         }
-        acc
+        (cmean, cvar)
     }
 }
 
-/// Day-of-week + hour weighted projection (DESIGN.md §11). Superseded by the
-/// trend model for live forecasts; retained as a building block and for tests.
-#[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-pub fn dow_weighted(
-    consumed: f64,
-    limit: Option<f64>,
-    start: DateTime<Utc>,
-    end: DateTime<Utc>,
+/// How many weeks of history to fit the rate model over (bounds compute; still
+/// captures the weekly cycle many times over).
+const MODEL_LOOKBACK_WEEKS: i64 = 26;
+/// Empirical-Bayes shrinkage strength (in "weeks of data") toward the separable
+/// day-cycle × dow-cycle model, for cells with little history.
+const SHRINK_KAPPA: f64 = 3.0;
+
+/// Fit the rate model from an hour-by-hour walk over all covered history. Every
+/// hour in the coverage span contributes a sample (idle hours as 0), so rates
+/// reflect real occupancy, not just active hours.
+fn build_rate_model(
+    conn: &rusqlite::Connection,
+    service: &str,
+    unit: Unit,
+    tz: Tz,
     now: DateTime<Utc>,
-    grid: &DowGrid,
-    warn: f64,
-    danger: f64,
-) -> ForecastCore {
-    let total = grid.total();
-    let elapsed_hours = (now - start).num_seconds() as f64 / 3600.0;
-    // Cold-start guards → linear.
-    if total <= 0.0 || elapsed_hours < 48.0 {
-        return linear(consumed, limit, start, end, now, warn, danger);
+) -> Result<RateModel> {
+    let expr = match unit {
+        Unit::Tokens => {
+            "input_tokens+output_tokens+cache_read_tokens+cache_write_tokens+reasoning_tokens"
+        }
+        Unit::Usd => "cost_usd",
+    };
+    let since = now - Duration::days(7 * MODEL_LOOKBACK_WEEKS);
+    let sql = format!("SELECT ts, ({expr}) FROM events WHERE service=?1 AND ts>=?2");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params![service, since.to_rfc3339()], |r| {
+        let ts: String = r.get(0)?;
+        let amt: f64 = r.get(1)?;
+        Ok((ts, amt))
+    })?;
+
+    use std::collections::BTreeMap;
+    let mut by_hour: BTreeMap<i64, f64> = BTreeMap::new();
+    let mut first_hour: Option<i64> = None;
+    for row in rows {
+        let (ts_s, amt) = row?;
+        if let Ok(ts) = DateTime::parse_from_rfc3339(&ts_s) {
+            let secs = ts.with_timezone(&Utc).timestamp();
+            let hour = secs - secs.rem_euclid(3600);
+            *by_hour.entry(hour).or_insert(0.0) += amt;
+            first_hour = Some(first_hour.map_or(hour, |f| f.min(hour)));
+        }
     }
-    let elapsed_w = grid.weight_between(start, now);
-    let total_w = grid.weight_between(start, end);
-    if total_w <= 0.0 {
-        return linear(consumed, limit, start, end, now, warn, danger);
+    let now_hour = {
+        let s = now.timestamp();
+        s - s.rem_euclid(3600)
+    };
+
+    // Robustify: clamp extreme outlier hours (median + 4·MADσ of active hours) so
+    // a single spike day can't dominate the per-cell rate. Still empirical, just
+    // not run away by one anomaly.
+    if by_hour.len() >= 12 {
+        let mut nz: Vec<f64> = by_hour.values().copied().filter(|v| *v > 0.0).collect();
+        if nz.len() >= 12 {
+            nz.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let med = nz[nz.len() / 2];
+            let mut dev: Vec<f64> = nz.iter().map(|v| (v - med).abs()).collect();
+            dev.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let mad = dev[dev.len() / 2];
+            let bound = med + 4.0 * 1.4826 * mad;
+            if bound > 0.0 {
+                for v in by_hour.values_mut() {
+                    if *v > bound {
+                        *v = bound;
+                    }
+                }
+            }
+        }
     }
-    let expected_fraction_elapsed = elapsed_w / total_w;
-    if expected_fraction_elapsed <= 1e-6 {
-        return linear(consumed, limit, start, end, now, warn, danger);
+
+    // Per-cell running stats over every covered hour (idle hours count as 0).
+    let mut n = [[0.0f64; 24]; 7];
+    let mut sum = [[0.0f64; 24]; 7];
+    let mut sumsq = [[0.0f64; 24]; 7];
+    if let Some(start_h) = first_hour {
+        let mut h = start_h;
+        while h <= now_hour {
+            let amt = by_hour.get(&h).copied().unwrap_or(0.0);
+            if let Some(dt) = DateTime::<Utc>::from_timestamp(h, 0) {
+                let l = dt.with_timezone(&tz);
+                let d = l.weekday().num_days_from_monday() as usize;
+                let hr = l.hour() as usize;
+                n[d][hr] += 1.0;
+                sum[d][hr] += amt;
+                sumsq[d][hr] += amt * amt;
+            }
+            h += 3600;
+        }
     }
-    let projected = consumed / expected_fraction_elapsed;
-    let pct_now = limit.filter(|l| *l > 0.0).map(|l| consumed / l);
-    let pct_projected = limit.filter(|l| *l > 0.0).map(|l| projected / l);
-    ForecastCore {
-        projected,
-        pct_now,
-        pct_projected,
-        status: status_for(pct_projected, warn, danger),
-        eta_to_limit: eta(consumed, limit, start, now),
-        forecast_model: "dow_weighted".to_string(),
+
+    let total_n: f64 = n.iter().flatten().sum();
+    if total_n <= 0.0 {
+        return Ok(RateModel { lambda: [[0.0; 24]; 7], var: [[0.0; 24]; 7], tz, weeks: 0.0 });
     }
+    let total_sum: f64 = sum.iter().flatten().sum();
+    let total_sumsq: f64 = sumsq.iter().flatten().sum();
+    let base = total_sum / total_n; // overall mean tokens/hour
+    let v_pooled = (total_sumsq / total_n - base * base).max(0.0);
+
+    // Separable cycle factors (mean 1): dow-cycle and hour-of-day-cycle.
+    let mut dfac = [1.0f64; 7];
+    let mut hfac = [1.0f64; 24];
+    if base > 0.0 {
+        for d in 0..7 {
+            let (mut s, mut c) = (0.0, 0.0);
+            for h in 0..24 {
+                s += sum[d][h];
+                c += n[d][h];
+            }
+            if c > 0.0 {
+                dfac[d] = (s / c) / base;
+            }
+        }
+        for h in 0..24 {
+            let (mut s, mut c) = (0.0, 0.0);
+            for d in 0..7 {
+                s += sum[d][h];
+                c += n[d][h];
+            }
+            if c > 0.0 {
+                hfac[h] = (s / c) / base;
+            }
+        }
+    }
+
+    let mut lambda = [[0.0f64; 24]; 7];
+    let mut var = [[0.0f64; 24]; 7];
+    for d in 0..7 {
+        for h in 0..24 {
+            let nc = n[d][h];
+            let mean_c = if nc > 0.0 { sum[d][h] / nc } else { 0.0 };
+            let var_c = if nc > 0.0 {
+                (sumsq[d][h] / nc - mean_c * mean_c).max(0.0)
+            } else {
+                0.0
+            };
+            let lam_sep = base * dfac[d] * hfac[h];
+            let lam = (nc * mean_c + SHRINK_KAPPA * lam_sep) / (nc + SHRINK_KAPPA);
+            lambda[d][h] = lam.max(0.0);
+            // Prior variance scales with the square of the cell rate.
+            let v_prior = if base > 0.0 {
+                v_pooled * (lam / base).powi(2)
+            } else {
+                v_pooled
+            };
+            var[d][h] = ((nc * var_c + SHRINK_KAPPA * v_prior) / (nc + SHRINK_KAPPA)).max(0.0);
+        }
+    }
+    Ok(RateModel { lambda, var, tz, weeks: total_n / 168.0 })
 }
 
 /// Fixed 7-day window. If a reset time is known, the window ends there; otherwise
@@ -213,50 +341,6 @@ pub fn service_unit(cfg: &Config, service: &str) -> Unit {
             .and_then(|l| l.unit_parsed().ok())
             .unwrap_or(Unit::Tokens),
     }
-}
-
-/// Build the DoW/hour grid from the last `weeks` of events for a service.
-fn build_grid(
-    conn: &rusqlite::Connection,
-    service: &str,
-    unit: Unit,
-    tz: Tz,
-    now: DateTime<Utc>,
-    weeks: i64,
-) -> Result<DowGrid> {
-    let since = now - Duration::days(7 * weeks.max(1));
-    let expr = match unit {
-        Unit::Tokens => "input_tokens+output_tokens+cache_read_tokens+cache_write_tokens+reasoning_tokens",
-        Unit::Usd => "cost_usd",
-    };
-    let sql = format!("SELECT ts, ({expr}) AS amt FROM events WHERE service=?1 AND ts>=?2");
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(
-        rusqlite::params![service, since.to_rfc3339()],
-        |r| {
-            let ts: String = r.get(0)?;
-            let amt: f64 = r.get(1)?;
-            Ok((ts, amt))
-        },
-    )?;
-    let mut weight = [[0.0f64; 24]; 7];
-    for row in rows {
-        let (ts_s, amt) = row?;
-        if let Ok(ts) = DateTime::parse_from_rfc3339(&ts_s) {
-            let local = ts.with_timezone(&tz);
-            let dow = local.weekday().num_days_from_monday() as usize;
-            let hour = local.hour() as usize;
-            weight[dow][hour] += amt;
-        }
-    }
-    // Normalize to sum 1.0 (if any activity).
-    let total: f64 = weight.iter().flatten().sum();
-    if total > 0.0 {
-        for cell in weight.iter_mut().flatten() {
-            *cell /= total;
-        }
-    }
-    Ok(DowGrid { weight, tz })
 }
 
 /// The next reset time for a service's weekly window, if known: provider-real
@@ -328,103 +412,11 @@ fn recent_daily_burn(
 }
 
 // ---------------------------------------------------------------------------
-// Trend model + projection cone
+// Projection cone (point-process model)
 // ---------------------------------------------------------------------------
 
-const PACE_LOOKBACK_DAYS: i64 = 21;
-const PACE_HALF_LIFE_DAYS: f64 = 5.0;
 const CONE_Z: f64 = 1.0; // ±1σ band
-const CONE_STEPS: i64 = 32;
-
-/// Band bounds relative to the level, so σ is never zero or absurd.
-const SIGMA_MIN_FRAC: f64 = 0.10;
-const SIGMA_MAX_FRAC: f64 = 0.60;
-
-/// Estimate the weekly volume `P` (tokens/week) and its 1σ from recent daily
-/// usage: a robust (winsorized, EWMA-weighted toward recent days) mean daily
-/// volume × 7. The day-of-week grid is intentionally *not* used here — it shapes
-/// the projection cone, but de-seasonalizing the level lets one outlier day
-/// distort every other day's estimate (a spike inflates the whole grid, which
-/// then divides normal days by a too-small share). Winsorizing daily totals
-/// directly keeps a 10× spike from running the pace away.
-fn estimate_pace(
-    conn: &rusqlite::Connection,
-    service: &str,
-    unit: Unit,
-    now: DateTime<Utc>,
-) -> Result<(f64, f64)> {
-    let mut samples: Vec<(f64, f64)> = Vec::new(); // (daily volume, EWMA weight)
-    for d in 0..PACE_LOOKBACK_DAYS {
-        let end = now - Duration::days(d);
-        let start = end - Duration::days(1);
-        let total = db::consumed_in_window(conn, service, unit, start, end)?;
-        let w = 0.5f64.powf(d as f64 / PACE_HALF_LIFE_DAYS);
-        samples.push((total, w));
-    }
-    if samples.iter().map(|(_, w)| *w).sum::<f64>() <= 0.0 {
-        let p = db::consumed_in_window(conn, service, unit, now - Duration::days(7), now)?;
-        return Ok((p, 0.3 * p));
-    }
-    let (daily, daily_sigma) = robust_pace(&samples);
-    Ok((daily * 7.0, daily_sigma * 7.0))
-}
-
-/// Weighted median of `(value, weight)` samples.
-fn weighted_median(samples: &[(f64, f64)]) -> f64 {
-    if samples.is_empty() {
-        return 0.0;
-    }
-    let mut s: Vec<(f64, f64)> = samples.to_vec();
-    s.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    let total: f64 = s.iter().map(|(_, w)| *w).sum();
-    let mut acc = 0.0;
-    for (v, w) in &s {
-        acc += *w;
-        if acc >= total / 2.0 {
-            return *v;
-        }
-    }
-    s.last().map(|(v, _)| *v).unwrap_or(0.0)
-}
-
-/// Weighted mean and (population) standard deviation.
-fn weighted_mean_sd(samples: &[(f64, f64)]) -> (f64, f64) {
-    let sw: f64 = samples.iter().map(|(_, w)| *w).sum();
-    if sw <= 0.0 {
-        return (0.0, 0.0);
-    }
-    let mean = samples.iter().map(|(v, w)| v * w).sum::<f64>() / sw;
-    let var = samples.iter().map(|(v, w)| w * (v - mean).powi(2)).sum::<f64>() / sw;
-    (mean, var.max(0.0).sqrt())
-}
-
-/// Robust pace: winsorize samples to ±3 robust-σ (MAD) around the weighted
-/// median, then take the weighted mean (unbiased for the total) and a σ bounded
-/// to a sane fraction of the level. A single spike day can't whip the estimate.
-fn robust_pace(samples: &[(f64, f64)]) -> (f64, f64) {
-    if samples.is_empty() {
-        return (0.0, 0.0);
-    }
-    let m = weighted_median(samples);
-    let devs: Vec<(f64, f64)> = samples.iter().map(|(v, w)| ((v - m).abs(), *w)).collect();
-    let mad = weighted_median(&devs);
-    let (raw_mean, _raw_sd) = weighted_mean_sd(samples);
-    // A robust scale that never collapses to zero when a majority of days are
-    // equal (MAD=0) — falls back to fractions of the median/mean.
-    let robust_scale = (1.4826 * mad)
-        .max(0.5 * m)
-        .max(0.25 * raw_mean)
-        .max(f64::MIN_POSITIVE);
-    let hi = m + 3.0 * robust_scale; // clip spikes to a few robust-σ above typical
-    let wins: Vec<(f64, f64)> = samples.iter().map(|(v, w)| (v.clamp(0.0, hi), *w)).collect();
-    let (p, sd) = weighted_mean_sd(&wins);
-    let sigma = if p > 0.0 {
-        sd.clamp(SIGMA_MIN_FRAC * p, SIGMA_MAX_FRAC * p)
-    } else {
-        sd
-    };
-    (p, sigma)
-}
+const CONE_STEPS: i64 = 48;
 
 /// Horizon the cone projects to: the reset for a fixed window, else a full week
 /// ahead for a rolling window.
@@ -436,51 +428,45 @@ fn horizon_end(now: DateTime<Utc>, window_end: DateTime<Utc>, rolling: bool) -> 
     }
 }
 
-/// Pure cone-point math: cumulative low/mid/high at a future point, given the
-/// weekly pace `p` (±`sigma`), the fraction of a week `w` elapsed since `now`,
-/// and any rolled-off usage (rolling windows only).
-fn cone_values(consumed: f64, p: f64, sigma: f64, z: f64, w: f64, rolloff: f64) -> (f64, f64, f64) {
-    let mid = consumed + p * w - rolloff;
-    let lo = consumed + (p - z * sigma).max(0.0) * w - rolloff;
-    let hi = consumed + (p + z * sigma) * w - rolloff;
-    (lo.max(0.0), mid.max(0.0), hi.max(0.0))
-}
-
-/// Build the projection fan from `now` to the horizon. For rolling windows the
-/// oldest days fall out of the trailing window, so we subtract the actual usage
-/// that rolls off — the rolling total can fall even at a steady pace.
-fn build_cone(
+/// Build the projection fan from `now` to the horizon using the rate model: at
+/// each step the cumulative future mean is `Σ λ` and the ±1σ band is `±z·√(Σ v)`
+/// (independent increments, so the band widens with the horizon). For rolling
+/// windows the oldest days age out, so the deterministic rolled-off usage is
+/// subtracted from the level (no added uncertainty). Returns the fan and the
+/// projected net total at the horizon.
+fn project_cone(
+    model: &RateModel,
     conn: &rusqlite::Connection,
     service: &str,
     unit: Unit,
-    grid: &DowGrid,
     consumed: f64,
     now: DateTime<Utc>,
     window_end: DateTime<Utc>,
     rolling: bool,
-    p: f64,
-    sigma: f64,
-) -> Result<Vec<ConePoint>> {
+) -> Result<(Vec<ConePoint>, f64)> {
     let horizon = horizon_end(now, window_end, rolling);
     let span = (horizon - now).num_seconds();
-    if span <= 0 {
-        return Ok(Vec::new());
+    if span <= 0 || !model.has_data() {
+        return Ok((Vec::new(), consumed));
     }
     let roll_start = now - Duration::days(WINDOW_DAYS);
     let mut out = Vec::with_capacity(CONE_STEPS as usize + 1);
     for i in 0..=CONE_STEPS {
         let t = now + Duration::seconds(span * i / CONE_STEPS);
-        let w = grid.weight_between(now, t); // fraction of a week in (now, t]
+        let (cmean, cvar) = model.accumulate_future(now, t);
+        let sd = cvar.max(0.0).sqrt();
         let rolloff = if rolling {
-            let roll_to = roll_start + (t - now);
-            db::consumed_in_window(conn, service, unit, roll_start, roll_to)?
+            db::consumed_in_window(conn, service, unit, roll_start, roll_start + (t - now))?
         } else {
             0.0
         };
-        let (lo, mid, hi) = cone_values(consumed, p, sigma, CONE_Z, w, rolloff);
+        let mid = (consumed + cmean - rolloff).max(0.0);
+        let lo = (consumed + cmean - CONE_Z * sd - rolloff).max(0.0);
+        let hi = (consumed + cmean + CONE_Z * sd - rolloff).max(0.0);
         out.push(ConePoint { ts: t, lo, mid, hi });
     }
-    Ok(out)
+    let endpoint = out.last().map(|p| p.mid).unwrap_or(consumed);
+    Ok((out, endpoint))
 }
 
 /// Produce the forecast for one service's weekly window. Fixed window when a reset
@@ -506,21 +492,24 @@ pub fn forecast_service(
     };
     let consumed = db::consumed_in_window(&conn, service, unit, start, now)?;
 
-    // Projected *tokens* at the horizon, from the trend model: current weekly
-    // pace (recent-weighted, weekday-shaped) applied along the future profile.
-    let grid = build_grid(&conn, service, unit, tz, now, cfg.forecast.history_weeks)?;
-    let (pace, _sigma) = estimate_pace(&conn, service, unit, now)?;
+    // Projected *tokens* at the horizon, from the point-process rate model:
+    // Σ λ over future hours, minus any usage that ages out of a rolling window.
+    let model = build_rate_model(&conn, service, unit, tz, now)?;
     let horizon = horizon_end(now, end, rolling);
-    let projected_tokens = if grid.total() > 0.0 {
-        let w = grid.weight_between(now, horizon);
-        let rolloff = if rolling { consumed } else { 0.0 };
-        (consumed + pace * w - rolloff).max(0.0)
+    let projected_tokens = if model.has_data() {
+        let (cmean, _cvar) = model.accumulate_future(now, horizon);
+        let rolloff = if rolling {
+            db::consumed_in_window(&conn, service, unit, now - Duration::days(WINDOW_DAYS), now)?
+        } else {
+            0.0
+        };
+        (consumed + cmean - rolloff).max(0.0)
     } else if rolling {
-        pace
+        consumed
     } else {
         linear(consumed, None, start, end, now, warn, danger).projected
     };
-    let model_name = "trend";
+    let model_name = "point_process";
 
     // Level (cap + current %) — grounded on readings and stable across provider
     // quota resets (a reset zeroes the counter, not the weekly allowance).
@@ -910,14 +899,13 @@ pub fn cumulative_view(
         token_cumulative_by_model(&conn, service, f.window_start, now, &markers)?;
 
     // Projection cone (tokens) → percent of cap, anchored at the fiducial-grounded
-    // current %, over now → window_end.
+    // current %, over now → window_end, from the point-process rate model.
     let tz: Tz = cfg.timezone.parse().unwrap_or(chrono_tz::UTC);
-    let grid = build_grid(&conn, service, unit, tz, now, cfg.forecast.history_weeks)?;
-    let (pace_weekly, pace_sigma) = estimate_pace(&conn, service, unit, now)?;
-    let token_cone = build_cone(
-        &conn, service, unit, &grid, f.consumed, now, f.window_end, rolling, pace_weekly,
-        pace_sigma,
-    )?;
+    let model = build_rate_model(&conn, service, unit, tz, now)?;
+    let pace_weekly = model.weekly_mean();
+    let pace_sigma = model.weekly_sigma();
+    let (token_cone, _endpoint) =
+        project_cone(&model, &conn, service, unit, f.consumed, now, f.window_end, rolling)?;
     let cone_pct = match (f.limit, f.pct_now) {
         (Some(cap), Some(pn)) if cap > 0.0 => token_cone
             .iter()
@@ -1068,58 +1056,39 @@ mod tests {
         assert!(f.eta_to_limit.is_none());
     }
 
-    #[test]
-    fn dow_cold_start_falls_back_to_linear() {
-        let start = dt("2026-08-10T00:00:00Z");
-        let end = dt("2026-08-17T00:00:00Z");
-        let now = dt("2026-08-11T00:00:00Z"); // only 1 day elapsed (<48h)
-        let grid = DowGrid {
-            weight: [[1.0 / 168.0; 24]; 7],
-            tz: chrono_tz::UTC,
-        };
-        let f = dow_weighted(10.0, Some(100.0), start, end, now, &grid, 0.8, 1.0);
-        assert_eq!(f.forecast_model, "linear");
+    fn uniform_model(lambda: f64, var: f64) -> RateModel {
+        RateModel { lambda: [[lambda; 24]; 7], var: [[var; 24]; 7], tz: chrono_tz::UTC, weeks: 4.0 }
     }
 
     #[test]
-    fn dow_uniform_grid_matches_linear() {
-        // A uniform grid should behave like linear: half elapsed → double.
-        let start = dt("2026-08-10T00:00:00Z");
-        let end = dt("2026-08-17T00:00:00Z");
-        let now = dt("2026-08-13T12:00:00Z"); // exactly half of 7 days
-        let grid = DowGrid {
-            weight: [[1.0 / 168.0; 24]; 7],
-            tz: chrono_tz::UTC,
-        };
-        let f = dow_weighted(50.0, Some(100.0), start, end, now, &grid, 0.8, 1.0);
-        assert_eq!(f.forecast_model, "dow_weighted");
-        assert!((f.projected - 100.0).abs() < 0.5, "projected={}", f.projected);
+    fn rate_model_weekly_totals() {
+        // 168 cells × λ = weekly mean; variances add → weekly σ = √(168·var).
+        let m = uniform_model(10.0, 4.0);
+        assert!((m.weekly_mean() - 168.0 * 10.0).abs() < 1e-6);
+        assert!((m.weekly_sigma() - (168.0f64 * 4.0).sqrt()).abs() < 1e-6);
     }
 
     #[test]
-    fn dow_weighted_front_loaded_history() {
-        // History says all activity happens in the first half of the window, so
-        // by the midpoint we've done ~100% of expected → projected ≈ consumed.
-        let start = dt("2026-08-10T00:00:00Z"); // Mon 00:00 UTC
-        let end = dt("2026-08-17T00:00:00Z");
-        let now = dt("2026-08-13T12:00:00Z"); // exactly half
-        let mut weight = [[0.0f64; 24]; 7];
-        // Put all weight on Mon–Wed (dow 0,1,2), the first ~3.5 days.
-        for d in 0..3 {
-            for h in 0..24 {
-                weight[d][h] = 1.0;
-            }
-        }
-        // normalize
-        let total: f64 = weight.iter().flatten().sum();
-        for c in weight.iter_mut().flatten() {
-            *c /= total;
-        }
-        let grid = DowGrid { weight, tz: chrono_tz::UTC };
-        let f = dow_weighted(80.0, Some(100.0), start, end, now, &grid, 0.8, 1.0);
-        // expected_fraction_elapsed is high → projected only modestly above consumed.
-        assert!(f.projected < 100.0, "projected={}", f.projected);
-        assert!(f.projected >= 80.0);
+    fn rate_model_accumulate_grows_mean_and_var_linearly() {
+        let m = uniform_model(10.0, 4.0);
+        let now = dt("2026-08-10T00:00:00Z");
+        let (m1, v1) = m.accumulate_future(now, now + Duration::hours(10));
+        assert!((m1 - 100.0).abs() < 1e-6, "mean={m1}"); // 10h × 10
+        assert!((v1 - 40.0).abs() < 1e-6, "var={v1}"); // 10h × 4
+        // Twice the horizon → twice the mean and twice the variance (so the ±σ
+        // band widens like √horizon, not linearly).
+        let (m2, v2) = m.accumulate_future(now, now + Duration::hours(20));
+        assert!((m2 - 200.0).abs() < 1e-6);
+        assert!((v2 - 80.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rate_model_partial_hour_apportioned() {
+        let m = uniform_model(10.0, 4.0);
+        let now = dt("2026-08-10T00:30:00Z"); // start mid-hour
+        let (mean, var) = m.accumulate_future(now, now + Duration::minutes(30));
+        assert!((mean - 5.0).abs() < 1e-6, "mean={mean}"); // half an hour
+        assert!((var - 2.0).abs() < 1e-6, "var={var}");
     }
 
     #[test]
@@ -1149,57 +1118,6 @@ mod tests {
         // If every reading is sub-floor, there's no usable cap.
         assert!(plan_cap(&[(1.6, 1.0)]).is_none());
         assert!(plan_cap(&[]).is_none());
-    }
-
-    #[test]
-    fn cone_starts_tight_and_widens() {
-        // At w=0 the fan is a point at `consumed`.
-        let (lo0, mid0, hi0) = cone_values(1000.0, 500.0, 100.0, 1.0, 0.0, 0.0);
-        assert!((lo0 - 1000.0).abs() < 1e-9 && (mid0 - 1000.0).abs() < 1e-9 && (hi0 - 1000.0).abs() < 1e-9);
-        // Halfway through the week: mid adds p*w, band is ±z*sigma*w.
-        let (lo, mid, hi) = cone_values(1000.0, 500.0, 100.0, 1.0, 0.5, 0.0);
-        assert!((mid - 1250.0).abs() < 1e-9, "mid={mid}");
-        assert!((lo - 1200.0).abs() < 1e-9, "lo={lo}");
-        assert!((hi - 1300.0).abs() < 1e-9, "hi={hi}");
-        // Band widens with w.
-        let (_, _, hi_full) = cone_values(1000.0, 500.0, 100.0, 1.0, 1.0, 0.0);
-        let (_, _, hi_half) = cone_values(1000.0, 500.0, 100.0, 1.0, 0.5, 0.0);
-        assert!(hi_full - 1000.0 > hi_half - 1000.0);
-    }
-
-    #[test]
-    fn robust_pace_shrugs_off_a_single_spike() {
-        // Six ordinary days near 100, one 50× spike day.
-        let mut s: Vec<(f64, f64)> = (0..6).map(|_| (100.0, 1.0)).collect();
-        s.push((5000.0, 1.0));
-        let (p, sigma) = robust_pace(&s);
-        // The spike is winsorized, so the level stays near typical, not the raw
-        // mean of ~800.
-        assert!(p < 300.0, "p={p} should stay near typical usage");
-        assert!(p > 80.0, "p={p} shouldn't collapse");
-        // σ is bounded to a sane fraction of the level.
-        assert!(sigma <= 0.60 * p + 1e-6 && sigma >= 0.10 * p - 1e-6, "sigma={sigma}");
-    }
-
-    #[test]
-    fn robust_pace_flat_series_has_floor_sigma() {
-        let s: Vec<(f64, f64)> = (0..10).map(|_| (200.0, 1.0)).collect();
-        let (p, sigma) = robust_pace(&s);
-        assert!((p - 200.0).abs() < 1e-6);
-        // No raw spread, but σ is floored so the cone isn't a zero-width line.
-        assert!((sigma - 0.10 * 200.0).abs() < 1e-6, "sigma={sigma}");
-    }
-
-    #[test]
-    fn robust_pace_empty_is_zero() {
-        assert_eq!(robust_pace(&[]), (0.0, 0.0));
-    }
-
-    #[test]
-    fn cone_rolloff_can_lower_the_total() {
-        // Rolling: heavy usage rolling off can pull the projected total below now.
-        let (_, mid, _) = cone_values(1000.0, 200.0, 0.0, 1.0, 1.0, 800.0);
-        assert!((mid - 400.0).abs() < 1e-9, "mid={mid}"); // 1000 + 200 - 800
     }
 
     #[test]

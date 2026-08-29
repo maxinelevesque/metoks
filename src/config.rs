@@ -153,9 +153,6 @@ pub struct ForecastConfig {
     pub warn_threshold: f64,
     #[serde(default = "default_danger")]
     pub danger_threshold: f64,
-    /// weeks of history for the day-of-week weight grid
-    #[serde(default = "default_history_weeks")]
-    pub history_weeks: i64,
 }
 
 impl Default for ForecastConfig {
@@ -164,22 +161,18 @@ impl Default for ForecastConfig {
             model: default_forecast_model(),
             warn_threshold: default_warn(),
             danger_threshold: default_danger(),
-            history_weeks: default_history_weeks(),
         }
     }
 }
 
 fn default_forecast_model() -> String {
-    "dow_weighted".to_string()
+    "point_process".to_string()
 }
 fn default_warn() -> f64 {
     0.80
 }
 fn default_danger() -> f64 {
     1.00
-}
-fn default_history_weeks() -> i64 {
-    4
 }
 
 impl Config {
