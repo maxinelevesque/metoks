@@ -149,6 +149,30 @@ const MODEL_LOOKBACK_WEEKS: i64 = 26;
 /// Empirical-Bayes shrinkage strength (in "weeks of data") toward the separable
 /// day-cycle × dow-cycle model, for cells with little history.
 const SHRINK_KAPPA: f64 = 3.0;
+/// Kernel bandwidths (in bins) for smoothing the two cyclic profiles.
+const HOUR_BW: f64 = 1.5; // hours
+const DOW_BW: f64 = 0.9; // days
+
+/// Circular Nadaraya–Watson kernel smoother of a per-bin mean over a cyclic axis
+/// of `period` bins (wrap-around distance), with a Gaussian kernel of bandwidth
+/// `bw` and each bin weighted by its sample `count`. Used to estimate the two
+/// usage cycle harmonics (hour-of-day, day-of-week) smoothly and robustly.
+fn circular_smooth(mean: &[f64], count: &[f64], period: usize, bw: f64) -> Vec<f64> {
+    let mut out = vec![0.0f64; period];
+    for i in 0..period {
+        let (mut num, mut den) = (0.0, 0.0);
+        for j in 0..period {
+            let raw = (i as f64 - j as f64).abs();
+            let dist = raw.min(period as f64 - raw); // wrap-around
+            let k = (-0.5 * (dist / bw).powi(2)).exp();
+            let w = k * count[j];
+            num += w * mean[j];
+            den += w;
+        }
+        out[i] = if den > 0.0 { num / den } else { mean[i] };
+    }
+    out
+}
 
 /// Fit the rate model from an hour-by-hour walk over all covered history. Every
 /// hour in the coverage span contributes a sample (idle hours as 0), so rates
@@ -243,19 +267,24 @@ fn build_rate_model(
     let base = total_sum / total_n; // overall mean tokens/hour
     let v_pooled = (total_sumsq / total_n - base * base).max(0.0);
 
-    // Separable cycle factors (mean 1): dow-cycle and hour-of-day-cycle.
+    // Separable cycle factors (mean ~1): the two harmonics — day-of-week and
+    // hour-of-day — estimated with a circular kernel smoother over the raw per-bin
+    // means, so each cycle is smooth and robust to sparse/noisy bins.
     let mut dfac = [1.0f64; 7];
     let mut hfac = [1.0f64; 24];
     if base > 0.0 {
+        let mut dmean = [0.0f64; 7];
+        let mut dcnt = [0.0f64; 7];
+        let mut hmean = [0.0f64; 24];
+        let mut hcnt = [0.0f64; 24];
         for d in 0..7 {
             let (mut s, mut c) = (0.0, 0.0);
             for h in 0..24 {
                 s += sum[d][h];
                 c += n[d][h];
             }
-            if c > 0.0 {
-                dfac[d] = (s / c) / base;
-            }
+            dcnt[d] = c;
+            dmean[d] = if c > 0.0 { s / c } else { 0.0 };
         }
         for h in 0..24 {
             let (mut s, mut c) = (0.0, 0.0);
@@ -263,9 +292,16 @@ fn build_rate_model(
                 s += sum[d][h];
                 c += n[d][h];
             }
-            if c > 0.0 {
-                hfac[h] = (s / c) / base;
-            }
+            hcnt[h] = c;
+            hmean[h] = if c > 0.0 { s / c } else { 0.0 };
+        }
+        let ds = circular_smooth(&dmean, &dcnt, 7, DOW_BW);
+        let hs = circular_smooth(&hmean, &hcnt, 24, HOUR_BW);
+        for d in 0..7 {
+            dfac[d] = ds[d] / base;
+        }
+        for h in 0..24 {
+            hfac[h] = hs[h] / base;
         }
     }
 
@@ -1058,6 +1094,32 @@ mod tests {
 
     fn uniform_model(lambda: f64, var: f64) -> RateModel {
         RateModel { lambda: [[lambda; 24]; 7], var: [[var; 24]; 7], tz: chrono_tz::UTC, weeks: 4.0 }
+    }
+
+    #[test]
+    fn circular_smooth_constant_is_unchanged() {
+        let out = circular_smooth(&[5.0; 7], &[1.0; 7], 7, 0.9);
+        for v in out {
+            assert!((v - 5.0).abs() < 1e-9, "v={v}");
+        }
+    }
+
+    #[test]
+    fn circular_smooth_wraps_around() {
+        // A single peak at bin 0 should leak symmetrically to bins 1 and 6 (wrap).
+        let mut mean = [0.0f64; 7];
+        mean[0] = 10.0;
+        let out = circular_smooth(&mean, &[1.0; 7], 7, 1.0);
+        assert!(out[6] > 0.0, "wrap neighbor should get weight: {}", out[6]);
+        assert!((out[1] - out[6]).abs() < 1e-9, "symmetric: {} vs {}", out[1], out[6]);
+        assert!(out[0] > out[1], "peak stays highest at 0");
+    }
+
+    #[test]
+    fn circular_smooth_ignores_zero_count_bins() {
+        // Bin 1 has no samples (count 0), so its mean must not influence bin 0.
+        let out = circular_smooth(&[10.0, 999.0], &[1.0, 0.0], 2, 1.0);
+        assert!((out[0] - 10.0).abs() < 1e-9, "out0={}", out[0]);
     }
 
     #[test]
