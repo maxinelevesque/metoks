@@ -554,14 +554,11 @@ pub fn forecast_service(
     let off_device_tokens = off_rate * elapsed_hours;
     let on_device_tokens = consumed;
 
-    // Cap: the regression's true cap (which accounts for off-device) when we have
-    // it, else the reading-grounded cap.
-    let (reading_cap, reading_src, _rp) =
+    // Cap: the reading-grounded median (stable). The regression's cap is too
+    // noisy to trust (our tokens are a ~40% proxy for the provider's quota-%), so
+    // we only use the regression's *off-device rate*, and only when significant.
+    let (limit, limit_source, _rp) =
         resolve_cap_and_pct(&conn, cfg, service, unit, now, start, consumed)?;
-    let (limit, limit_source) = match od {
-        Some(o) if o.true_cap > 0.0 => (Some(o.true_cap), Some("regression".to_string())),
-        _ => (reading_cap, reading_src),
-    };
 
     // Current % = total (on + off) ÷ cap, anchored to the latest reading so a
     // just-logged % still reads true.
@@ -678,11 +675,19 @@ pub struct OffDevice {
     pub intervals: usize,   // fiducial intervals the fit used
 }
 
+/// Minimum |t| for the off-device (time) coefficient to be believed. Our token
+/// counts are a noisy proxy for the provider's quota-% (and readings are integer
+/// %), so we only claim off-device when the time term is statistically
+/// distinguishable from zero — otherwise the "off-device" is just proxy noise.
+const OFFDEVICE_T_MIN: f64 = 2.0;
+const OFFDEVICE_MIN_INTERVALS: usize = 3;
+
 /// Fit `Δpct/100 = a·Δon_device + b·Δhours` (through the origin, non-negative)
 /// across fiducial intervals, then recover `true_cap = 1/a` and
 /// `off_rate = b/a` (tokens/hour). The Δhours term captures quota drawn down that
-/// isn't explained by on-device tokens — i.e. off-device usage. Needs ≥2
-/// intervals; returns None if the data can't identify a positive cap.
+/// isn't explained by on-device tokens — i.e. off-device usage — but it's only
+/// returned when it's statistically significant (t ≥ `OFFDEVICE_T_MIN`), so
+/// collinear/steady usage or proxy noise doesn't fabricate off-device.
 fn fit_offdevice(intervals: &[(f64, f64, f64)]) -> Option<(f64, f64)> {
     // (Δon_device tokens, Δhours, Δpct)
     let obs: Vec<(f64, f64, f64)> = intervals
@@ -690,9 +695,10 @@ fn fit_offdevice(intervals: &[(f64, f64, f64)]) -> Option<(f64, f64)> {
         .filter(|(on, dt, dp)| *on >= 0.0 && *dt > 0.0 && *dp > 0.0)
         .copied()
         .collect();
-    if obs.len() < 2 {
+    if obs.len() < OFFDEVICE_MIN_INTERVALS {
         return None;
     }
+    let n = obs.len();
     let (mut s11, mut s12, mut s22, mut s1y, mut s2y) = (0.0, 0.0, 0.0, 0.0, 0.0);
     for (on, dt, dp) in &obs {
         let (x1, x2, y) = (*on, *dt, dp / 100.0);
@@ -703,24 +709,31 @@ fn fit_offdevice(intervals: &[(f64, f64, f64)]) -> Option<(f64, f64)> {
         s2y += x2 * y;
     }
     let det = s11 * s22 - s12 * s12;
-    // On-device-only fallback (b=0): a = Σx1y/Σx1².
-    let fallback = || -> Option<(f64, f64)> {
-        if s11 > 0.0 {
-            let a = s1y / s11;
-            if a > 0.0 {
-                return Some((1.0 / a, 0.0));
-            }
-        }
-        None
-    };
-    if det.abs() < 1e-12 {
-        return fallback();
+    if det.abs() < 1e-12 || s11 <= 0.0 {
+        return None; // predictors collinear → off-device unidentifiable
     }
     let a = (s1y * s22 - s2y * s12) / det;
     let b = (s11 * s2y - s12 * s1y) / det;
-    if a <= 0.0 || b < 0.0 {
-        // A negative rate/cap is unphysical → drop the time term.
-        return fallback();
+    if a <= 0.0 || b <= 0.0 {
+        return None; // no positive cap / no positive off-device signal
+    }
+    // Significance of the time coefficient: t = b / SE(b).
+    let rss: f64 = obs
+        .iter()
+        .map(|(on, dt, dp)| {
+            let e = dp / 100.0 - a * on - b * dt;
+            e * e
+        })
+        .sum();
+    let dof = (n - 2) as f64;
+    let se_b = if dof > 0.0 {
+        ((rss / dof) * (s11 / det)).max(0.0).sqrt()
+    } else {
+        0.0
+    };
+    let t = if se_b > 0.0 { b / se_b } else { f64::INFINITY };
+    if t < OFFDEVICE_T_MIN {
+        return None; // off-device not distinguishable from proxy noise
     }
     Some((1.0 / a, b / a))
 }
@@ -1298,17 +1311,15 @@ mod tests {
     }
 
     #[test]
-    fn offdevice_pure_ondevice_has_zero_rate() {
-        // All quota explained by on-device tokens (cap 1000): a=1/1000, b=0.
+    fn offdevice_pure_ondevice_claims_none() {
+        // All quota explained by on-device tokens (b=0) → no off-device signal.
         let iv = [(100.0, 5.0, 10.0), (200.0, 3.0, 20.0), (50.0, 10.0, 5.0)];
-        let (cap, off) = fit_offdevice(&iv).unwrap();
-        assert!((cap - 1000.0).abs() < 1.0, "cap={cap}");
-        assert!(off.abs() < 1e-6, "off_rate={off}");
+        assert!(fit_offdevice(&iv).is_none());
     }
 
     #[test]
     fn offdevice_recovers_cap_and_rate() {
-        // cap=1000, off_rate=10/hr: Δpct/100 = (Δon + 10·Δt)/1000.
+        // cap=1000, off_rate=10/hr: Δpct/100 = (Δon + 10·Δt)/1000 (exact → t=∞).
         let mk = |on: f64, dt: f64| (on, dt, (on + 10.0 * dt) / 1000.0 * 100.0);
         let iv = [mk(100.0, 5.0), mk(200.0, 3.0), mk(50.0, 10.0), mk(300.0, 2.0)];
         let (cap, off) = fit_offdevice(&iv).unwrap();
@@ -1317,8 +1328,16 @@ mod tests {
     }
 
     #[test]
-    fn offdevice_needs_two_intervals() {
+    fn offdevice_collinear_predictors_claim_none() {
+        // Δon ∝ Δt (steady usage) → the on/off split is unidentifiable.
+        let iv = [(100.0, 10.0, 10.0), (200.0, 20.0, 20.0), (50.0, 5.0, 5.0)];
+        assert!(fit_offdevice(&iv).is_none());
+    }
+
+    #[test]
+    fn offdevice_needs_enough_intervals() {
         assert!(fit_offdevice(&[(100.0, 5.0, 10.0)]).is_none());
+        assert!(fit_offdevice(&[(100.0, 5.0, 10.0), (200.0, 3.0, 20.0)]).is_none());
         assert!(fit_offdevice(&[]).is_none());
     }
 
