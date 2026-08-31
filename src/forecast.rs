@@ -547,41 +547,74 @@ pub fn forecast_service(
     };
     let model_name = "point_process";
 
-    // Level (cap + current %) — grounded on readings and stable across provider
-    // quota resets (a reset zeroes the counter, not the weekly allowance).
-    let (limit, limit_source, pct_now) =
-        resolve_cap_and_pct(&conn, cfg, service, unit, now, start, consumed)?;
+    // Off-device (unwitnessed) usage, estimated by regressing fiducial intervals.
+    let od = offdevice_model(&conn, service, unit, now)?;
+    let off_rate = od.map(|o| o.off_rate).unwrap_or(0.0);
+    let elapsed_hours = ((now - start).num_seconds() as f64 / 3600.0).max(0.0);
+    let off_device_tokens = off_rate * elapsed_hours;
+    let on_device_tokens = consumed;
 
+    // Cap: the regression's true cap (which accounts for off-device) when we have
+    // it, else the reading-grounded cap.
+    let (reading_cap, reading_src, _rp) =
+        resolve_cap_and_pct(&conn, cfg, service, unit, now, start, consumed)?;
+    let (limit, limit_source) = match od {
+        Some(o) if o.true_cap > 0.0 => (Some(o.true_cap), Some("regression".to_string())),
+        _ => (reading_cap, reading_src),
+    };
+
+    // Current % = total (on + off) ÷ cap, anchored to the latest reading so a
+    // just-logged % still reads true.
+    let pct_now = match limit {
+        Some(cap) if cap > 0.0 => {
+            let in_window = db::fiducials_since(&conn, service, start)?;
+            if let Some(lastf) = in_window.last() {
+                let on_at = db::consumed_in_window(&conn, service, unit, start, lastf.ts)?;
+                let dt = ((now - lastf.ts).num_seconds() as f64 / 3600.0).max(0.0);
+                Some(lastf.percent / 100.0 + ((consumed - on_at) + off_rate * dt) / cap)
+            } else {
+                Some((consumed + off_device_tokens) / cap)
+            }
+        }
+        _ => None,
+    };
+
+    // Projection: on-device point process + steady off-device draw to the horizon.
+    let remaining_hours = ((horizon - now).num_seconds() as f64 / 3600.0).max(0.0);
+    let future_off = off_rate * remaining_hours;
+    let projected_total = projected_tokens + off_device_tokens + future_off;
     let pct_projected = match (limit, pct_now) {
-        (Some(cap), Some(pn)) if cap > 0.0 => Some(pn + (projected_tokens - consumed) / cap),
+        (Some(cap), Some(pn)) if cap > 0.0 => {
+            Some(pn + ((projected_tokens - consumed) + future_off) / cap)
+        }
         _ => None,
     };
 
     // Just after a reset a fixed window has too little history to project from;
     // a rolling window is low-confidence only when there's no usage at all.
-    let elapsed_hours = (now - start).num_hours();
     let low_confidence = if rolling {
         consumed <= 0.0
     } else {
-        elapsed_hours < 24
+        (now - start).num_hours() < 24
     };
-    // Don't raise an alarm on an unreliable early-window projection.
     let status = if low_confidence {
         "unknown".to_string()
     } else {
         status_for(pct_projected, warn, danger)
     };
 
-    // ETA to 100%: tokens remaining to cap ÷ burn rate.
+    // ETA to 100%: tokens remaining to cap ÷ total (on + off) burn rate.
     let eta = match (limit, pct_now) {
         (Some(cap), Some(pn)) if cap > 0.0 && pn < 1.0 => {
             let tokens_left = cap * (1.0 - pn);
-            let burn_per_sec = if rolling {
+            let on_burn = if rolling {
                 recent_daily_burn(&conn, service, unit, now, 2)? / 86400.0
+            } else if elapsed_hours > 0.0 {
+                consumed / (elapsed_hours * 3600.0)
             } else {
-                let elapsed = (now - start).num_seconds() as f64;
-                if elapsed > 0.0 { consumed / elapsed } else { 0.0 }
+                0.0
             };
+            let burn_per_sec = on_burn + off_rate / 3600.0;
             if burn_per_sec > 0.0 {
                 now.checked_add_signed(Duration::seconds((tokens_left / burn_per_sec) as i64))
             } else {
@@ -599,7 +632,7 @@ pub fn forecast_service(
         limit,
         limit_source,
         pct_now,
-        projected: projected_tokens,
+        projected: projected_total,
         pct_projected,
         status,
         eta_to_limit: eta,
@@ -607,6 +640,9 @@ pub fn forecast_service(
         window_end: end,
         forecast_model: model_name.to_string(),
         low_confidence,
+        on_device_tokens,
+        off_device_tokens,
+        off_device_rate: off_rate,
     })
 }
 
@@ -630,6 +666,96 @@ fn plan_cap(readings: &[(f64, f64)]) -> Option<f64> {
     }
     caps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     Some(caps[caps.len() / 2])
+}
+
+/// Estimated off-device usage for an account: the true weekly cap and a steady
+/// rate of quota drawn by usage we can't witness locally (other machines, web,
+/// CI, unparsed tools).
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct OffDevice {
+    pub true_cap: f64,      // tokens for a full window (on-device + off-device)
+    pub off_rate: f64,      // off-device tokens per hour
+    pub intervals: usize,   // fiducial intervals the fit used
+}
+
+/// Fit `Δpct/100 = a·Δon_device + b·Δhours` (through the origin, non-negative)
+/// across fiducial intervals, then recover `true_cap = 1/a` and
+/// `off_rate = b/a` (tokens/hour). The Δhours term captures quota drawn down that
+/// isn't explained by on-device tokens — i.e. off-device usage. Needs ≥2
+/// intervals; returns None if the data can't identify a positive cap.
+fn fit_offdevice(intervals: &[(f64, f64, f64)]) -> Option<(f64, f64)> {
+    // (Δon_device tokens, Δhours, Δpct)
+    let obs: Vec<(f64, f64, f64)> = intervals
+        .iter()
+        .filter(|(on, dt, dp)| *on >= 0.0 && *dt > 0.0 && *dp > 0.0)
+        .copied()
+        .collect();
+    if obs.len() < 2 {
+        return None;
+    }
+    let (mut s11, mut s12, mut s22, mut s1y, mut s2y) = (0.0, 0.0, 0.0, 0.0, 0.0);
+    for (on, dt, dp) in &obs {
+        let (x1, x2, y) = (*on, *dt, dp / 100.0);
+        s11 += x1 * x1;
+        s12 += x1 * x2;
+        s22 += x2 * x2;
+        s1y += x1 * y;
+        s2y += x2 * y;
+    }
+    let det = s11 * s22 - s12 * s12;
+    // On-device-only fallback (b=0): a = Σx1y/Σx1².
+    let fallback = || -> Option<(f64, f64)> {
+        if s11 > 0.0 {
+            let a = s1y / s11;
+            if a > 0.0 {
+                return Some((1.0 / a, 0.0));
+            }
+        }
+        None
+    };
+    if det.abs() < 1e-12 {
+        return fallback();
+    }
+    let a = (s1y * s22 - s2y * s12) / det;
+    let b = (s11 * s2y - s12 * s1y) / det;
+    if a <= 0.0 || b < 0.0 {
+        // A negative rate/cap is unphysical → drop the time term.
+        return fallback();
+    }
+    Some((1.0 / a, b / a))
+}
+
+/// Estimate an account's off-device usage by regressing its fiducial intervals
+/// (same-window consecutive readings) — the on-device token delta and elapsed
+/// time against the true quota-% consumed. See `fit_offdevice`.
+fn offdevice_model(
+    conn: &rusqlite::Connection,
+    service: &str,
+    unit: Unit,
+    now: DateTime<Utc>,
+) -> Result<Option<OffDevice>> {
+    let fids = db::fiducials_since(conn, service, now - Duration::days(CAP_CARRY_DAYS))?;
+    let mut intervals: Vec<(f64, f64, f64)> = Vec::new();
+    for pair in fids.windows(2) {
+        let (a, b) = (&pair[0], &pair[1]);
+        // Only compare readings within the same window (comparable cumulatives).
+        if (a.window_start - b.window_start).num_seconds().abs() >= 3600 {
+            continue;
+        }
+        if b.percent <= a.percent {
+            continue;
+        }
+        let on_a = db::consumed_in_window(conn, service, unit, a.window_start, a.ts)?;
+        let on_b = db::consumed_in_window(conn, service, unit, b.window_start, b.ts)?;
+        let d_on = (on_b - on_a).max(0.0);
+        let d_hours = (b.ts - a.ts).num_seconds() as f64 / 3600.0;
+        intervals.push((d_on, d_hours, b.percent - a.percent));
+    }
+    Ok(fit_offdevice(&intervals).map(|(cap, rate)| OffDevice {
+        true_cap: cap,
+        off_rate: rate,
+        intervals: intervals.len(),
+    }))
 }
 
 /// Resolve the token cap and current fraction. The cap is the plan's weekly
@@ -827,6 +953,10 @@ pub struct Cumulative {
     /// estimated current weekly volume (tokens) and its 1σ, for labelling
     pub pace_weekly: f64,
     pub pace_sigma: f64,
+    /// on-device vs estimated off-device split this window
+    pub on_device_tokens: f64,
+    pub off_device_tokens: f64,
+    pub off_device_rate: f64,
 }
 
 /// Cumulative observed tokens over [start, upto], split per model, sampled at
@@ -979,6 +1109,9 @@ pub fn cumulative_view(
         fiducials,
         pace_weekly,
         pace_sigma,
+        on_device_tokens: f.on_device_tokens,
+        off_device_tokens: f.off_device_tokens,
+        off_device_rate: f.off_device_rate,
     })
 }
 
@@ -1162,6 +1295,31 @@ mod tests {
         assert_eq!(end - start, Duration::days(7));
         // 2026-08-20 + 7d = 2026-08-27
         assert_eq!(end, dt("2026-08-27T00:00:00Z"));
+    }
+
+    #[test]
+    fn offdevice_pure_ondevice_has_zero_rate() {
+        // All quota explained by on-device tokens (cap 1000): a=1/1000, b=0.
+        let iv = [(100.0, 5.0, 10.0), (200.0, 3.0, 20.0), (50.0, 10.0, 5.0)];
+        let (cap, off) = fit_offdevice(&iv).unwrap();
+        assert!((cap - 1000.0).abs() < 1.0, "cap={cap}");
+        assert!(off.abs() < 1e-6, "off_rate={off}");
+    }
+
+    #[test]
+    fn offdevice_recovers_cap_and_rate() {
+        // cap=1000, off_rate=10/hr: Δpct/100 = (Δon + 10·Δt)/1000.
+        let mk = |on: f64, dt: f64| (on, dt, (on + 10.0 * dt) / 1000.0 * 100.0);
+        let iv = [mk(100.0, 5.0), mk(200.0, 3.0), mk(50.0, 10.0), mk(300.0, 2.0)];
+        let (cap, off) = fit_offdevice(&iv).unwrap();
+        assert!((cap - 1000.0).abs() < 1.0, "cap={cap}");
+        assert!((off - 10.0).abs() < 0.1, "off_rate={off}");
+    }
+
+    #[test]
+    fn offdevice_needs_two_intervals() {
+        assert!(fit_offdevice(&[(100.0, 5.0, 10.0)]).is_none());
+        assert!(fit_offdevice(&[]).is_none());
     }
 
     #[test]

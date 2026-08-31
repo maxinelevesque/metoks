@@ -349,6 +349,9 @@ mod tests {
             fiducials: vec![FiducialPoint { ts: Utc::now(), percent: 28.0 }],
             pace_weekly: 500_000.0,
             pace_sigma: 100_000.0,
+            on_device_tokens: 280_000.0,
+            off_device_tokens: 20_000.0,
+            off_device_rate: 500.0,
         }
     }
 

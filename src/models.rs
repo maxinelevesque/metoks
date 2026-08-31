@@ -90,4 +90,10 @@ pub struct Forecast {
     /// True when too little of the window has elapsed for a trustworthy projection
     /// (e.g. just after a reset). The UI should de-emphasize `projected`.
     pub low_confidence: bool,
+    /// On-device (witnessed) tokens this window.
+    pub on_device_tokens: f64,
+    /// Estimated off-device (unwitnessed) tokens this window (off_rate × elapsed).
+    pub off_device_tokens: f64,
+    /// Estimated off-device draw, tokens/hour (0 when not estimable).
+    pub off_device_rate: f64,
 }
