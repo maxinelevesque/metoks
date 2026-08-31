@@ -4,11 +4,15 @@ import StatusStrip from "./components/StatusStrip";
 import UsageChart from "./components/UsageChart";
 import CumulativePanel from "./components/CumulativePanel";
 import Breakdown from "./components/Breakdown";
+import Projects from "./components/Projects";
+
+type Tab = "overview" | "projects";
 
 export default function App() {
   const { snapshot, conn, refresh } = useSnapshot();
   const [selected, setSelected] = useState<string>("claude_code");
   const [refreshKey, setRefreshKey] = useState(0);
+  const [tab, setTab] = useState<Tab>("overview");
 
   const forecasts = snapshot?.forecast.forecasts ?? [];
   const cumulatives = snapshot?.forecast.cumulatives ?? [];
@@ -28,6 +32,20 @@ export default function App() {
           <span className="brand__mark">◈</span> metoks
         </div>
         <div className="topbar__right">
+          <div className="toggle">
+            <button
+              className={"toggle__btn" + (tab === "overview" ? " toggle__btn--on" : "")}
+              onClick={() => setTab("overview")}
+            >
+              Overview
+            </button>
+            <button
+              className={"toggle__btn" + (tab === "projects" ? " toggle__btn--on" : "")}
+              onClick={() => setTab("projects")}
+            >
+              Projects
+            </button>
+          </div>
           <span className={"conn conn--" + conn} title={"connection: " + conn}>
             {conn === "sse" ? "live" : conn === "polling" ? "polling" : "…"}
           </span>
@@ -36,6 +54,10 @@ export default function App() {
 
       {!snapshot ? (
         <div className="loading">Connecting to metoks…</div>
+      ) : tab === "projects" ? (
+        <main className="grid">
+          <Projects tick={snapshot.generated_at} />
+        </main>
       ) : (
         <main className="grid">
           <StatusStrip forecasts={forecasts} selected={selected} onSelect={setSelected} />

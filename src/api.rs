@@ -53,6 +53,7 @@ pub fn router(state: AppState) -> Router {
         .route("/snapshot", get(snapshot_ep))
         .route("/stream", get(stream_ep))
         .route("/breakdown", get(breakdown_ep))
+        .route("/projects", get(projects_ep))
         .route("/fiducials", get(fiducials_ep))
         .route("/limits", post(set_limit))
         .route("/anchor", post(anchor_ep))
@@ -354,6 +355,35 @@ async fn cumulative_ep(
 ) -> impl IntoResponse {
     match cumulative_cached(&st, &q.service, Utc::now()) {
         Ok(v) => Json(v).into_response(),
+        Err(e) => err(e),
+    }
+}
+
+// ---- /api/projects (sparklines) -------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct ProjectsQuery {
+    #[serde(default)]
+    days: Option<i64>,
+    #[serde(default)]
+    bucket_hours: Option<i64>,
+}
+
+async fn projects_ep(
+    State(st): State<AppState>,
+    Query(q): Query<ProjectsQuery>,
+) -> impl IntoResponse {
+    let now = Utc::now();
+    let days = q.days.unwrap_or(14);
+    let bucket = q.bucket_hours.unwrap_or(6);
+    let since = now - Duration::days(days);
+    let conn = match st.pool.get() {
+        Ok(c) => c,
+        Err(e) => return err(e.into()),
+    };
+    match db::project_series(&conn, since, now, bucket) {
+        Ok(rows) => Json(json!({ "days": days, "bucket_hours": bucket, "projects": rows }))
+            .into_response(),
         Err(e) => err(e),
     }
 }

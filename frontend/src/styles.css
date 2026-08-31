@@ -408,6 +408,35 @@ body {
   padding: 4px 10px;
 }
 
+/* projects tab / sparklines */
+.projects {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 10px 24px;
+}
+.project-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--grid);
+}
+.project-row__label {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: 13px;
+}
+.project-row__name {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-weight: 600;
+}
+.spark {
+  width: 100%;
+  height: 34px;
+  display: block;
+}
+
 /* breakdown mini-bars */
 .bar-col {
   width: 28%;

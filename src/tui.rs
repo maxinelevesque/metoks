@@ -17,8 +17,14 @@ use ratatui::{
 };
 
 use crate::config::Config;
-use crate::db::DbPool;
+use crate::db::{self, DbPool, ProjectSeries};
 use crate::forecast::{self, Cumulative};
+
+#[derive(Clone, Copy, PartialEq)]
+enum View {
+    Overview,
+    Projects,
+}
 
 fn status_color(status: &str) -> Color {
     match status {
@@ -50,17 +56,27 @@ pub fn run(pool: &DbPool, cfg: &Config) -> Result<()> {
     let mut term = Terminal::new(CrosstermBackend::new(stdout))?;
 
     let mut selected = 0usize;
+    let mut view = View::Overview;
     let mut data = refresh(pool, cfg, &services);
+    let mut projects = fetch_projects(pool);
     let mut last = Instant::now();
 
     let res = (|| -> Result<()> {
         loop {
-            term.draw(|f| ui(f, &data, selected))?;
+            match view {
+                View::Overview => term.draw(|f| ui(f, &data, selected))?,
+                View::Projects => term.draw(|f| ui_projects(f, &projects))?,
+            };
             if event::poll(Duration::from_millis(250))? {
                 if let Event::Key(k) = event::read()? {
                     match k.code {
                         KeyCode::Char('q') | KeyCode::Esc => break,
-                        KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                        KeyCode::Char('p') => view = View::Projects,
+                        KeyCode::Char('o') => view = View::Overview,
+                        KeyCode::Tab => {
+                            view = if view == View::Overview { View::Projects } else { View::Overview };
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
                             if !services.is_empty() {
                                 selected = (selected + 1) % services.len();
                             }
@@ -72,6 +88,7 @@ pub fn run(pool: &DbPool, cfg: &Config) -> Result<()> {
                         }
                         KeyCode::Char('r') => {
                             data = refresh(pool, cfg, &services);
+                            projects = fetch_projects(pool);
                             last = Instant::now();
                         }
                         _ => {}
@@ -80,6 +97,7 @@ pub fn run(pool: &DbPool, cfg: &Config) -> Result<()> {
             }
             if last.elapsed() > Duration::from_secs(3) {
                 data = refresh(pool, cfg, &services);
+                projects = fetch_projects(pool);
                 last = Instant::now();
             }
             if selected >= data.len().max(1) {
@@ -173,7 +191,7 @@ fn ui(f: &mut Frame, data: &[Cumulative], selected: usize) {
 
     f.render_widget(
         Paragraph::new(Span::styled(
-            " q quit · ↑/↓ or Tab switch · r refresh",
+            " q quit · ↑/↓ select · p projects · r refresh",
             Style::default().fg(Color::DarkGray),
         )),
         outer[3],
@@ -266,14 +284,26 @@ fn render_chart(f: &mut Frame, area: Rect, c: &Cumulative) {
         })
         .collect();
 
+    // On-device vs estimated off-device split of usage so far.
+    let split = {
+        let total = c.on_device_tokens + c.off_device_tokens;
+        if c.off_device_rate > 0.0 && total > 0.0 {
+            format!("  ·  on-device {:.0}% / off {:.0}%",
+                c.on_device_tokens / total * 100.0,
+                c.off_device_tokens / total * 100.0)
+        } else {
+            String::new()
+        }
+    };
     let title = format!(
-        " {} — {} used, proj {}  (cap {})",
+        " {} — {} used, proj {}  (cap {}){}",
         label(&c.service),
         pct(c.pct_now),
         pct(c.pct_projected),
         c.cap
             .map(|v| crate::tui::fmt_tokens(v))
             .unwrap_or_else(|| "—".into()),
+        split,
     );
 
     let chart = Chart::new(datasets)
@@ -295,6 +325,116 @@ fn render_chart(f: &mut Frame, area: Rect, c: &Cumulative) {
                 ]),
         );
     f.render_widget(chart, area);
+}
+
+fn fetch_projects(pool: &DbPool) -> Vec<ProjectSeries> {
+    let now = chrono::Utc::now();
+    let since = now - chrono::Duration::days(14);
+    pool.get()
+        .ok()
+        .and_then(|c| db::project_series(&c, since, now, 6).ok())
+        .unwrap_or_default()
+}
+
+/// Render a series as a 2-row braille sparkline (dot columns; each braille cell
+/// packs 2 columns × 4 dot-rows). Normalized to the series' own max.
+fn braille_sparkline(vals: &[f64], height_chars: usize) -> Vec<String> {
+    let rows = height_chars * 4;
+    if vals.is_empty() || rows == 0 {
+        return vec![String::new(); height_chars];
+    }
+    let width = vals.len().div_ceil(2);
+    let mut grid = vec![vec![0u8; width]; height_chars];
+    let max = vals.iter().cloned().fold(0.0_f64, f64::max).max(1e-9);
+    let bit = |within: usize, right: bool| -> u8 {
+        match (within, right) {
+            (0, false) => 0x01,
+            (1, false) => 0x02,
+            (2, false) => 0x04,
+            (3, false) => 0x40,
+            (0, true) => 0x08,
+            (1, true) => 0x10,
+            (2, true) => 0x20,
+            (3, true) => 0x80,
+            _ => 0,
+        }
+    };
+    for (ci, v) in vals.iter().enumerate() {
+        let level = ((v / max) * rows as f64).round() as usize;
+        let char_col = ci / 2;
+        let right = ci % 2 == 1;
+        for filled in 0..level {
+            let global_row = rows - 1 - filled; // fill from the bottom up
+            let char_row = global_row / 4;
+            let within = global_row % 4;
+            grid[char_row][char_col] |= bit(within, right);
+        }
+    }
+    grid.into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|b| char::from_u32(0x2800 + b as u32).unwrap_or(' '))
+                .collect()
+        })
+        .collect()
+}
+
+fn ui_projects(f: &mut Frame, projects: &[ProjectSeries]) {
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
+        .split(f.area());
+
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            " metoks — projects · tokens/6h, last 14 days (each normalized)",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )),
+        outer[0],
+    );
+
+    let per = 3u16; // label + 2 braille rows
+    let n_fit = (outer[1].height / per).max(1) as usize;
+    if projects.is_empty() {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                "  no project usage in the last 14 days",
+                Style::default().fg(Color::DarkGray),
+            )),
+            outer[1],
+        );
+    } else {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(vec![Constraint::Length(per); n_fit.min(projects.len())])
+            .split(outer[1]);
+        let palette = [Color::Cyan, Color::Green, Color::Yellow, Color::Magenta, Color::Blue];
+        for (i, p) in projects.iter().take(rows.len()).enumerate() {
+            let spark = braille_sparkline(&p.points, 2);
+            let color = palette[i % palette.len()];
+            let head = Line::from(vec![
+                Span::styled(
+                    format!(" {} ", p.project),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{} tok", fmt_tokens(p.total as f64)),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]);
+            let s0 = Line::from(Span::styled(format!(" {}", spark[0]), Style::default().fg(color)));
+            let s1 = Line::from(Span::styled(format!(" {}", spark[1]), Style::default().fg(color)));
+            f.render_widget(Paragraph::new(vec![head, s0, s1]), rows[i]);
+        }
+    }
+
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            " q quit · o overview · Tab switch · r refresh",
+            Style::default().fg(Color::DarkGray),
+        )),
+        outer[2],
+    );
 }
 
 pub fn fmt_tokens(n: f64) -> String {
@@ -361,5 +501,33 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         let data = vec![sample()];
         term.draw(|f| ui(f, &data, 0)).unwrap();
+    }
+
+    #[test]
+    fn braille_sparkline_shape_and_growth() {
+        let s = braille_sparkline(&[0.0, 1.0, 2.0, 4.0], 2);
+        assert_eq!(s.len(), 2); // two rows
+        // Every cell is a braille glyph (U+2800..=U+28FF).
+        for line in &s {
+            for ch in line.chars() {
+                assert!((0x2800..=0x28FF).contains(&(ch as u32)), "non-braille: {ch:?}");
+            }
+        }
+        // A flat-zero series renders empty braille (all blanks), a peak does not.
+        let flat = braille_sparkline(&[0.0, 0.0, 0.0, 0.0], 2);
+        let peak = braille_sparkline(&[0.0, 0.0, 0.0, 9.0], 2);
+        assert!(flat.join("").chars().all(|c| c as u32 == 0x2800));
+        assert!(peak.join("").chars().any(|c| c as u32 != 0x2800));
+    }
+
+    #[test]
+    fn projects_view_renders() {
+        let backend = TestBackend::new(100, 30);
+        let mut term = Terminal::new(backend).unwrap();
+        let projects = vec![
+            ProjectSeries { project: "alpha".into(), total: 1_000_000, points: vec![1.0, 5.0, 2.0, 8.0, 3.0] },
+            ProjectSeries { project: "beta".into(), total: 500_000, points: vec![0.0, 0.0, 4.0, 1.0, 0.0] },
+        ];
+        term.draw(|f| ui_projects(f, &projects)).unwrap();
     }
 }

@@ -80,6 +80,15 @@ export interface Cumulative {
   fiducials: FiducialPoint[];
   pace_weekly: number;
   pace_sigma: number;
+  on_device_tokens: number;
+  off_device_tokens: number;
+  off_device_rate: number;
+}
+
+export interface ProjectSeries {
+  project: string;
+  total: number;
+  points: number[];
 }
 
 export interface Bucket {

@@ -77,7 +77,9 @@ export default function CumulativePanel({
     const present = new Set(c.models);
     const keys = orderedModelKeys(present); // known models present + "Other"
     const byT = new Map<number, Row>();
-    // Left axis: cumulative tokens by model.
+    const wStart = new Date(c.window_start).getTime();
+    // Left axis: cumulative tokens by model, plus an estimated off-device band
+    // (steady off_rate) stacked on top so the total reaches the reading dots.
     for (const p of c.token_points) {
       const t = new Date(p.ts).getTime();
       const row = byT.get(t) ?? ({ t } as Row);
@@ -85,6 +87,10 @@ export default function CumulativePanel({
         const key = isKnownModel(m) ? m : OTHER_KEY;
         row[key] = ((row[key] as number) ?? 0) + p.cum[i];
       });
+      if (c.off_device_rate > 0) {
+        const hrs = Math.max(0, (t - wStart) / 3.6e6);
+        row["__offdev"] = c.off_device_rate * hrs;
+      }
       byT.set(t, row);
     }
     // Right axis: projection cone (percent).
@@ -216,6 +222,20 @@ export default function CumulativePanel({
               connectNulls={false}
             />
           ))}
+          {c.off_device_rate > 0 && (
+            <Area
+              yAxisId="tok"
+              type="linear"
+              dataKey="__offdev"
+              name="off-device (est.)"
+              stackId="tok"
+              stroke="none"
+              fill="var(--text-muted)"
+              fillOpacity={0.35}
+              isAnimationActive={false}
+              connectNulls={false}
+            />
+          )}
           {/* "now" divider between observed tokens and the projection */}
           <ReferenceLine
             yAxisId="pct"
@@ -275,7 +295,17 @@ export default function CumulativePanel({
       </p>
 
       <div className="stats">
-        <Stat label="Observed tokens" value={fmtTokens(c.consumed)} />
+        <Stat label="On-device tokens" value={fmtTokens(c.consumed)} />
+        {c.off_device_rate > 0 && (
+          <Stat
+            label="Off-device (est.)"
+            value={fmtTokens(c.off_device_tokens)}
+            sub={(() => {
+              const total = c.on_device_tokens + c.off_device_tokens;
+              return total > 0 ? `${Math.round((c.off_device_tokens / total) * 100)}% of usage` : "—";
+            })()}
+          />
+        )}
         <Stat
           label="Cap"
           value={c.cap != null ? fmtTokens(c.cap) : "—"}

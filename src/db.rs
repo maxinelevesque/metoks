@@ -463,6 +463,57 @@ pub fn list_fiducials(
     Ok(rows)
 }
 
+/// A per-project token time series (fixed-length buckets), for sparklines.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProjectSeries {
+    pub project: String,
+    pub total: i64,
+    pub points: Vec<f64>, // tokens per bucket, oldest → newest
+}
+
+/// Per-project token totals bucketed over `[since, now]` (aggregated across
+/// services), for the sparkline views. `bucket_hours` sets the resolution.
+pub fn project_series(
+    conn: &rusqlite::Connection,
+    since: DateTime<Utc>,
+    now: DateTime<Utc>,
+    bucket_hours: i64,
+) -> Result<Vec<ProjectSeries>> {
+    let bucket_secs = (bucket_hours.max(1)) * 3600;
+    let span = (now - since).num_seconds().max(bucket_secs);
+    let n = (span / bucket_secs) as usize + 1;
+    let mut stmt = conn.prepare(
+        "SELECT COALESCE(project,'(unknown)') AS p, ts,
+                input_tokens+output_tokens+cache_read_tokens+cache_write_tokens+reasoning_tokens
+         FROM events WHERE ts>=?1",
+    )?;
+    let rows = stmt.query_map(params![since.to_rfc3339()], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+    })?;
+    use std::collections::HashMap;
+    let mut map: HashMap<String, Vec<f64>> = HashMap::new();
+    let since_s = since.timestamp();
+    for row in rows {
+        let (proj, ts_s, tok) = row?;
+        if let Ok(ts) = DateTime::parse_from_rfc3339(&ts_s) {
+            let idx = ((ts.with_timezone(&Utc).timestamp() - since_s) / bucket_secs) as usize;
+            if idx < n {
+                let v = map.entry(proj).or_insert_with(|| vec![0.0; n]);
+                v[idx] += tok as f64;
+            }
+        }
+    }
+    let mut out: Vec<ProjectSeries> = map
+        .into_iter()
+        .map(|(project, points)| {
+            let total = points.iter().sum::<f64>() as i64;
+            ProjectSeries { project, total, points }
+        })
+        .collect();
+    out.sort_by(|a, b| b.total.cmp(&a.total));
+    Ok(out)
+}
+
 pub fn get_kv(conn: &rusqlite::Connection, k: &str) -> Result<Option<String>> {
     Ok(conn
         .query_row("SELECT v FROM kv WHERE k=?1", params![k], |r| r.get(0))
